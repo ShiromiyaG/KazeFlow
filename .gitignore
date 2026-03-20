@@ -27,14 +27,20 @@ env/
 
 # ── Training outputs ─────────────────────────────────────────────────────────
 # Entire logs/ tree: extracted features, sliced audio, checkpoints, TensorBoard
-logs/
+logs/**
+!logs/.gitkeep
 
 # ── User assets ──────────────────────────────────────────────────────────────
-assets/audios/
-assets/checkpoints/
-assets/datasets/
-assets/index/
-assets/training_presets/
+assets/audios/**
+assets/checkpoints/**
+assets/datasets/**
+assets/index/**
+assets/training_presets/**
+!assets/audios/.gitkeep
+!assets/checkpoints/.gitkeep
+!assets/datasets/.gitkeep
+!assets/index/.gitkeep
+!assets/training_presets/.gitkeep
 
 # ── Inference output ─────────────────────────────────────────────────────────
 output_kazeflow.wav
