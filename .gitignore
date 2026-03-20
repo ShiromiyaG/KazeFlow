@@ -1,0 +1,57 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# ── Environment ──────────────────────────────────────────────────────────────
+env/
+.env
+
+# ── Model weights (downloaded at runtime, not versioned) ─────────────────────
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.ckpt
+
+# Keep folder structure for auto-downloaded models
+!kazeflow/models/pretrained/**/.gitkeep
+
+# Keep small config files bundled with pretrained models
+!kazeflow/models/pretrained/embedders/**/config.json
+!kazeflow/models/pretrained/embedders/**/tokenizer*.json
+!kazeflow/models/pretrained/embedders/**/vocab.json
+
+# ── Training outputs ─────────────────────────────────────────────────────────
+# Entire logs/ tree: extracted features, sliced audio, checkpoints, TensorBoard
+logs/
+
+# ── User assets ──────────────────────────────────────────────────────────────
+assets/audios/
+assets/checkpoints/
+assets/datasets/
+assets/index/
+assets/training_presets/
+
+# ── Inference output ─────────────────────────────────────────────────────────
+output_kazeflow.wav
+output_*.wav
+
+# ── TensorBoard / profiling ───────────────────────────────────────────────────
+events.out.tfevents.*
+*.trace.json
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.orig
