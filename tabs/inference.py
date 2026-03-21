@@ -248,8 +248,8 @@ def create_inference_tab():
                 with gr.Row():
                     ode_method = gr.Radio(
                         label="ODE Method",
-                        choices=["euler", "midpoint"],
-                        value="euler",
+                        choices=["euler", "midpoint", "rk4"],
+                        value="midpoint",
                     )
                     f0_method = gr.Radio(
                         label="F0 Method",

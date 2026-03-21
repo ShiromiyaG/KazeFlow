@@ -401,12 +401,26 @@ class ConditionalFlowMatching(nn.Module):
                 v = self._cfg_velocity(x, t, content, f0, x_mask, g, guidance_scale)
                 x = x + v * dt
             elif method == "midpoint":
-                # Half step
+                # RK2 midpoint — 2 NFE/step, 2nd-order accurate
                 v1 = self._cfg_velocity(x, t, content, f0, x_mask, g, guidance_scale)
                 x_mid = x + v1 * (dt / 2)
                 t_mid = torch.full((B,), (i + 0.5) * dt, device=device)
                 v2 = self._cfg_velocity(x_mid, t_mid, content, f0, x_mask, g, guidance_scale)
                 x = x + v2 * dt
+            elif method == "rk4":
+                # Classical Runge-Kutta 4 — 4 NFE/step, 4th-order accurate.
+                # For OT-CFM the velocity field is nearly linear in t, so gains
+                # over midpoint are modest, but noise → structure errors are
+                # substantially smaller at the same step count.
+                t_half = torch.full((B,), (i + 0.5) * dt, device=device)
+                t_end  = torch.full((B,), (i + 1.0) * dt, device=device)
+                k1 = self._cfg_velocity(x,              t,      content, f0, x_mask, g, guidance_scale)
+                k2 = self._cfg_velocity(x + k1*(dt/2),  t_half, content, f0, x_mask, g, guidance_scale)
+                k3 = self._cfg_velocity(x + k2*(dt/2),  t_half, content, f0, x_mask, g, guidance_scale)
+                k4 = self._cfg_velocity(x + k3*dt,      t_end,  content, f0, x_mask, g, guidance_scale)
+                x = x + (k1 + 2*k2 + 2*k3 + k4) * (dt / 6)
+            else:
+                raise ValueError(f"Unknown ODE method '{method}'. Use 'euler', 'midpoint', or 'rk4'.")
 
             x = x * x_mask
 

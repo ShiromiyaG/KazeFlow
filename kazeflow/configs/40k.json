@@ -1,132 +1,175 @@
 {
-    "model": {
-        "sample_rate": 40000,
-        "hop_length": 400,
-        "n_fft": 2048,
-        "win_length": 2048,
-        "n_mels": 128,
-        "segment_size": 19200,
-        "segment_frames": 48,
-
-        "flow_matching": {
-            "mel_channels": 128,
-            "hidden_channels": 256,
-            "cond_channels": 768,
-            "gin_channels": 256,
-            "n_layers": 12,
-            "kernel_size": 7,
-            "dilation_rate": 2,
-            "dropout": 0.1,
-            "sigma_min": 1e-4,
-            "t_sampling": "logit_normal",
-            "t_logit_mean": 0.0,
-            "t_logit_std": 1.0,
-            "cfg_dropout": 0.1
-        },
-
-        "vocoder": {
-            "mel_channels": 128,
-            "upsample_rates": [8, 5, 5, 2],
-            "upsample_initial_channel": 384,
-            "upsample_kernel_sizes": [16, 10, 10, 4],
-            "resblock_kernel_sizes": [3, 7, 11],
-            "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-            "gin_channels": 256,
-            "n_harmonics": 6,
-            "use_checkpoint": false,
-            "n_fft": 2048,
-            "win_length": 2048
-        },
-
-        "discriminator": {
-            "stft_configs": [
-                {"n_fft": 2048, "hop_length": 512, "win_length": 2048},
-                {"n_fft": 1024, "hop_length": 256, "win_length": 1024}
-            ],
-            "stft_channels": 64,
-            "stft_max_channels": 128,
-            "stft_n_layers": 3,
-            "mpd_periods": [2, 3, 5],
-            "mpd_channels": 64,
-            "mpd_max_channels": 256,
-            "mpd_n_layers": 4,
-            "univhd_n_harmonics": 10,
-            "univhd_bins_per_octave": 24,
-            "univhd_channels": 64,
-            "univhd_n_fft": 2048,
-            "univhd_hop_length": 512,
-            "use_spectral_norm": false,
-            "use_san": true
-        },
-
-        "speaker_embed_dim": 256,
-        "n_speakers": 1
+  "model": {
+    "sample_rate": 40000,
+    "hop_length": 400,
+    "n_fft": 2048,
+    "win_length": 2048,
+    "n_mels": 128,
+    "segment_size": 19200,
+    "segment_frames": 48,
+    "flow_matching": {
+      "mel_channels": 128,
+      "hidden_channels": 256,
+      "cond_channels": 768,
+      "gin_channels": 256,
+      "n_layers": 12,
+      "kernel_size": 7,
+      "dilation_rate": 2,
+      "dropout": 0.1,
+      "sigma_min": 0.0001,
+      "t_sampling": "logit_normal",
+      "t_logit_mean": 0.0,
+      "t_logit_std": 1.0,
+      "cfg_dropout": 0.1
     },
-
-    "train": {
-        "batch_size": 8,
-        "learning_rate_flow": 2e-4,
-        "learning_rate_vocoder": 2e-4,
-        "learning_rate_disc": 1e-4,
-        "betas": [0.8, 0.99],
-        "betas_flow": [0.95, 0.999],
-        "betas_vocoder": [0.9, 0.999],
-        "betas_disc": [0.9, 0.999],
-        "lr_decay": 0.999,
-        "weight_decay": 0.01,
-        "epochs": 1000,
-        "save_every": 50,
-        "log_every": 100,
-
-        "grad_clip_flow": 3.0,
-        "cfm_grad_accum": 1,
-        "grad_clip_vocoder": 50.0,
-        "conv_post_grad_clip": 25.0,
-        "grad_clip_disc": 100.0,
-
-        "c_gen": 0.6,
-        "c_mel": 2.0,
-        "c_fm": 1.0,
-        "gan_loss_type": "soft_hinge",
-        "c_r1": 0.0,
-        "r1_interval": 4,
-        "c_lecam": 0.5,
-        "lecam_ema_decay": 0.999,
-        "c_env": 0.5,
-        "c_mrstft": 1.0,
-        "c_phase": 0.1,
-
-        "ema_decay": 0.999,
-        "use_gradient_balancer": false,
-        "balancer_ema_decay": 0.999,
-
-        "ode_steps_train": 2,
-        "vocoder_warmup_epochs": 0,
-
-        "f0_method": "rmvpe",
-        "num_workers": 4,
-        "pin_memory": true,
-        "seed": 42,
-
-        "precision": "fp32",
-        "torch_compile": false,
-        "compile_mode": "default"
+    "vocoder": {
+      "mel_channels": 128,
+      "upsample_rates": [
+        8,
+        5,
+        5,
+        2
+      ],
+      "upsample_initial_channel": 384,
+      "upsample_kernel_sizes": [
+        16,
+        10,
+        10,
+        4
+      ],
+      "resblock_kernel_sizes": [
+        3,
+        7,
+        11
+      ],
+      "resblock_dilation_sizes": [
+        [
+          1,
+          3,
+          5
+        ],
+        [
+          1,
+          3,
+          5
+        ],
+        [
+          1,
+          3,
+          5
+        ]
+      ],
+      "gin_channels": 256,
+      "n_harmonics": 6,
+      "use_checkpoint": false,
+      "n_fft": 2048,
+      "win_length": 2048
     },
-
-    "inference": {
-        "ode_steps": 4,
-        "ode_method": "midpoint",
-        "guidance_scale": 1.5,
-        "f0_method": "rmvpe",
-        "f0_shift": 0,
-        "index_rate": 0.0
+    "discriminator": {
+      "stft_configs": [
+        {
+          "n_fft": 2048,
+          "hop_length": 512,
+          "win_length": 2048
+        },
+        {
+          "n_fft": 1024,
+          "hop_length": 256,
+          "win_length": 1024
+        }
+      ],
+      "stft_channels": 64,
+      "stft_max_channels": 128,
+      "stft_n_layers": 3,
+      "mpd_periods": [
+        2,
+        3,
+        5
+      ],
+      "mpd_channels": 64,
+      "mpd_max_channels": 256,
+      "mpd_n_layers": 4,
+      "univhd_n_harmonics": 10,
+      "univhd_bins_per_octave": 24,
+      "univhd_channels": 64,
+      "univhd_n_fft": 2048,
+      "univhd_hop_length": 512,
+      "use_spectral_norm": false,
+      "use_san": true
     },
-
-    "preprocess": {
-        "min_duration": 0.5,
-        "max_duration": 15.0,
-        "highpass_freq": 48,
-        "target_db": -23.0,
-        "spin_model": "dr87/spinv2_rvc"
-    }
+    "speaker_embed_dim": 256,
+    "n_speakers": 1
+  },
+  "train": {
+    "batch_size": 8,
+    "learning_rate_flow": 0.0002,
+    "learning_rate_vocoder": 0.0002,
+    "learning_rate_disc": 0.0001,
+    "betas": [
+      0.8,
+      0.99
+    ],
+    "betas_flow": [
+      0.95,
+      0.999
+    ],
+    "betas_vocoder": [
+      0.9,
+      0.999
+    ],
+    "betas_disc": [
+      0.9,
+      0.999
+    ],
+    "lr_decay": 0.999,
+    "weight_decay": 0.01,
+    "epochs": 1000,
+    "save_every": 50,
+    "log_every": 100,
+    "grad_clip_flow": 3.0,
+    "cfm_grad_accum": 1,
+    "grad_clip_vocoder": 50.0,
+    "conv_post_grad_clip": 25.0,
+    "grad_clip_disc": 100.0,
+    "c_gen": 0.6,
+    "c_mel": 2.0,
+    "c_fm": 1.0,
+    "gan_loss_type": "soft_hinge",
+    "c_r1": 0.0,
+    "r1_interval": 4,
+    "c_lecam": 0.5,
+    "lecam_ema_decay": 0.999,
+    "c_env": 0.5,
+    "c_mrstft": 1.0,
+    "c_phase": 0.1,
+    "ema_decay": 0.999,
+    "use_gradient_balancer": false,
+    "balancer_ema_decay": 0.999,
+    "ode_method_train": "midpoint",
+    "vocoder_warmup_epochs": 0,
+    "f0_method": "rmvpe",
+    "num_workers": 4,
+    "pin_memory": true,
+    "seed": 42,
+    "precision": "fp32",
+    "torch_compile": false,
+    "compile_mode": "default",
+    "ode_steps_train_min": 1,
+    "ode_steps_train_max": 16
+  },
+  "inference": {
+    "ode_steps": 4,
+    "ode_method": "midpoint",
+    "guidance_scale": 1.5,
+    "f0_method": "rmvpe",
+    "f0_shift": 0,
+    "index_rate": 0.0
+  },
+  "preprocess": {
+    "min_duration": 0.5,
+    "max_duration": 15.0,
+    "highpass_freq": 48,
+    "target_db": -23.0,
+    "spin_model": "dr87/spinv2_rvc"
+  }
 }

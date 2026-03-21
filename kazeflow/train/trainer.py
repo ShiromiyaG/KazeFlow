@@ -302,7 +302,7 @@ class KazeFlowTrainer:
         self.scaler_disc = torch.amp.GradScaler('cuda', enabled=self._needs_scaler)
 
         # ── Logging ──────────────────────────────────────────────────────
-        self.writer = SummaryWriter(log_dir=str(self.output_dir / "logs"))
+        self.writer = SummaryWriter(log_dir=str(self.output_dir / "logs"), max_queue=1)
         self.global_step = 0
         self.epoch = 0
 
@@ -375,13 +375,14 @@ class KazeFlowTrainer:
             x_mask = torch.ones(B, 1, T, device=self.device)
             f0_expanded = f0_ref.unsqueeze(1)  # (B, 1, T)
 
+            infer_cfg = self.config.get("inference", {})
             mel_hat = self.flow.sample(
                 content=spin_ref,
                 f0=f0_expanded,
                 x_mask=x_mask,
                 g=g,
-                n_steps=self.config["train"].get("ode_steps_infer", 16),
-                method="euler",
+                n_steps=infer_cfg.get("ode_steps", self.config["train"].get("ode_steps_infer", 4)),
+                method=infer_cfg.get("ode_method", "midpoint"),
             )
 
             wav_hat = ema_voc(mel_hat, f0_ref, g=g)
@@ -512,13 +513,28 @@ class KazeFlowTrainer:
                     _accum_cfm = 0
 
                 # ── Step 2: Generate mel from flow (for vocoder) ─────
+                # Randomise ODE step count each batch so the vocoder learns
+                # to handle mel of any quality (1-step noisy → many-step clean).
+                # At inference the user can pick any N and quality scales
+                # monotonically — more steps always sounds better.
+                _train_cfg = self.config["train"]
+                _ode_min = _train_cfg.get("ode_steps_train_min", _train_cfg.get("ode_steps_train", 1))
+                _ode_max = _train_cfg.get("ode_steps_train_max", _train_cfg.get("ode_steps_train", 1))
+                if _ode_min == _ode_max:
+                    _ode_n = _ode_min
+                else:
+                    import math as _math
+                    import random as _random
+                    _ode_n = int(round(_math.exp(
+                        _random.uniform(_math.log(_ode_min), _math.log(_ode_max))
+                    )))
                 self.flow.eval()
                 with torch.no_grad():
                     mel_hat = self.flow.sample(
                         content=spin, f0=f0_expanded,
                         x_mask=x_mask, g=g,
-                        n_steps=self.config["train"].get("ode_steps_train", 1),
-                        method="euler",
+                        n_steps=_ode_n,
+                        method=_train_cfg.get("ode_method_train", "euler"),
                     )
                 self.flow.train()
 
@@ -738,9 +754,39 @@ class KazeFlowTrainer:
                     )
 
                     self.writer.flush()
+
+                    # ── Save eval outputs to disk ─────────────────────
+                    # TensorBoard reservoir-samples images/audio (max 4 by
+                    # default), so old captures disappear. Saving to disk
+                    # keeps every eval snapshot permanently.
+                    import torchaudio as _ta
+                    eval_dir = self.output_dir / "eval"
+                    eval_dir.mkdir(exist_ok=True)
+                    step_tag = f"ep{epoch+1:04d}_step{self.global_step}"
+                    plt.imsave(
+                        str(eval_dir / f"{step_tag}_mel_original.png"),
+                        mel_orig_np, origin="lower", cmap="viridis",
+                    )
+                    plt.imsave(
+                        str(eval_dir / f"{step_tag}_mel_generated.png"),
+                        mel_gen_np, origin="lower", cmap="viridis",
+                    )
+                    plt.imsave(
+                        str(eval_dir / f"{step_tag}_mel_diff.png"),
+                        np.abs(mel_orig_np - mel_gen_np),
+                        origin="lower", cmap="hot",
+                    )
+                    wav_disk = wav_hat_eval[0].detach().cpu().float()
+                    if wav_disk.dim() == 1:
+                        wav_disk = wav_disk.unsqueeze(0)
+                    _ta.save(
+                        str(eval_dir / f"{step_tag}_audio.wav"),
+                        wav_disk, self.sample_rate,
+                    )
+
                     logger.info(
                         f"Eval inference logged at epoch {epoch+1}, "
-                        f"step {self.global_step}"
+                        f"step {self.global_step} (TensorBoard + {eval_dir})"
                     )
                 except Exception as e:
                     logger.warning(f"Eval inference failed: {e}")
