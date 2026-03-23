@@ -213,10 +213,9 @@ def test_imports():
 
 
 def test_config_load():
-    """pretrain.json parses as valid JSON with required keys."""
-    config_path = Path(__file__).parent / "kazeflow" / "configs" / "pretrain.json"
-    with open(config_path) as f:
-        cfg = json.load(f)
+    """load_config returns a valid config with required keys."""
+    from kazeflow.configs import load_config
+    cfg = load_config(48000, preset="pretrain")
     assert "model" in cfg and "train" in cfg and "inference" in cfg
     assert "flow_matching" in cfg["model"]
     assert "vocoder" in cfg["model"]
@@ -263,14 +262,15 @@ def test_flow_matching_sample(cfg: dict, device: torch.device):
 
 
 def test_vocoder_forward(cfg: dict, device: torch.device):
-    """ChouwaGANGenerator forward returns correct waveform shape."""
-    from kazeflow.models.vocoder import ChouwaGANGenerator
+    """Vocoder forward returns correct waveform shape."""
+    from kazeflow.models.vocoder import build_vocoder
     m = cfg["model"]
     B = 2
     T = m["segment_frames"]
     T_audio = T * m["hop_length"]
-    model = ChouwaGANGenerator(
-        sr=m["sample_rate"], **m["vocoder"]
+    vocoder_type = m.get("vocoder_type", "chouwa_gan")
+    model = build_vocoder(
+        vocoder_type, sr=m["sample_rate"], **m["vocoder"]
     ).to(device).eval()
     mel = torch.randn(B, m["n_mels"], T, device=device)
     f0 = torch.rand(B, T, device=device) * 220 + 80
@@ -284,9 +284,10 @@ def test_vocoder_forward(cfg: dict, device: torch.device):
 
 def test_ema_generator(cfg: dict, device: torch.device):
     """EMAGenerator wraps a model and .get_model() returns a runnable copy."""
-    from kazeflow.models.vocoder import ChouwaGANGenerator, EMAGenerator
+    from kazeflow.models.vocoder import build_vocoder, EMAGenerator
     m = cfg["model"]
-    vocoder = ChouwaGANGenerator(sr=m["sample_rate"], **m["vocoder"]).to(device)
+    vocoder_type = m.get("vocoder_type", "chouwa_gan")
+    vocoder = build_vocoder(vocoder_type, sr=m["sample_rate"], **m["vocoder"]).to(device)
     ema = EMAGenerator(vocoder, decay=0.999)
     ema.to(device)
     # update should run without error
@@ -305,12 +306,14 @@ def test_ema_generator(cfg: dict, device: torch.device):
 
 
 def test_discriminator_forward(cfg: dict, device: torch.device):
-    """ChouwaGANDiscriminator forward returns matched lists of scores/fmaps."""
-    from kazeflow.models.discriminator import ChouwaGANDiscriminator
+    """Discriminator forward returns matched lists of scores/fmaps."""
+    from kazeflow.models.discriminator import build_discriminator
     m = cfg["model"]
     B = 2
     T_audio = m["segment_frames"] * m["hop_length"]
-    model = ChouwaGANDiscriminator(
+    disc_type = m.get("discriminator_type", m.get("vocoder_type", "chouwa_gan"))
+    model = build_discriminator(
+        disc_type,
         sample_rate=m["sample_rate"],
         **m["discriminator"],
     ).to(device).eval()
@@ -334,12 +337,14 @@ def test_losses(cfg: dict, device: torch.device):
         generator_loss_soft_hinge,
         mel_spectrogram_loss,
     )
-    from kazeflow.models.discriminator import ChouwaGANDiscriminator
+    from kazeflow.models.discriminator import build_discriminator
     m = cfg["model"]
     B = 2
     T_audio = m["segment_frames"] * m["hop_length"]
 
-    disc = ChouwaGANDiscriminator(
+    disc_type = m.get("discriminator_type", m.get("vocoder_type", "chouwa_gan"))
+    disc = build_discriminator(
+        disc_type,
         sample_rate=m["sample_rate"],
         **m["discriminator"],
     ).to(device).eval()
@@ -491,8 +496,8 @@ def test_full_training_step(cfg: dict, device: torch.device):
     CFM loss + vocoder GAN losses without touching disk.
     """
     from kazeflow.models.flow_matching import ConditionalFlowMatching
-    from kazeflow.models.vocoder import ChouwaGANGenerator, EMAGenerator
-    from kazeflow.models.discriminator import ChouwaGANDiscriminator
+    from kazeflow.models.vocoder import build_vocoder, EMAGenerator
+    from kazeflow.models.discriminator import build_discriminator
     from kazeflow.train.losses import (
         generator_loss_soft_hinge, discriminator_loss_hinge,
         feature_loss, mel_spectrogram_loss,
@@ -505,9 +510,11 @@ def test_full_training_step(cfg: dict, device: torch.device):
     cond_ch = m["flow_matching"]["cond_channels"]
     gin_ch  = m["flow_matching"]["gin_channels"]
 
+    vocoder_type = m.get("vocoder_type", "chouwa_gan")
+    disc_type = m.get("discriminator_type", vocoder_type)
     flow       = ConditionalFlowMatching(**m["flow_matching"]).to(device)
-    vocoder    = ChouwaGANGenerator(sr=m["sample_rate"], **m["vocoder"]).to(device)
-    disc       = ChouwaGANDiscriminator(sample_rate=m["sample_rate"], **m["discriminator"]).to(device)
+    vocoder    = build_vocoder(vocoder_type, sr=m["sample_rate"], **m["vocoder"]).to(device)
+    disc       = build_discriminator(disc_type, sample_rate=m["sample_rate"], **m["discriminator"]).to(device)
     spk_emb    = nn.Embedding(m["n_speakers"], m["speaker_embed_dim"]).to(device)
     ema_voc    = EMAGenerator(vocoder, decay=0.999); ema_voc.to(device)
 
@@ -592,7 +599,7 @@ def main():
 
     # ── Static / import tests ──────────────────────────────────────────────
     check("imports", test_imports)
-    check("config load (pretrain.json)", test_config_load)
+    check("config load (load_config)", test_config_load)
 
     # ── Model tests ───────────────────────────────────────────────────────
     check("ConditionalFlowMatching  forward (CFM loss)",

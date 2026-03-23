@@ -22,6 +22,7 @@ _ROOT = Path(__file__).parent.parent.parent  # kazeflow/tools/ -> kazeflow/ -> r
 
 RMVPE_PATH = _ROOT / "kazeflow" / "models" / "pretrained" / "predictors" / "rmvpe.pt"
 SPIN_V2_DIR = _ROOT / "kazeflow" / "models" / "pretrained" / "embedders" / "spin_v2"
+RSPIN_DIR = _ROOT / "kazeflow" / "models" / "pretrained" / "embedders" / "rspin"
 SMARTCUTTER_DIR = _ROOT / "kazeflow" / "models" / "pretrained" / "smartcutter"
 
 # ── Download manifests ─────────────────────────────────────────────────────────
@@ -50,6 +51,10 @@ _PREREQUISITES: list[tuple[Path, str]] = [
     (
         SMARTCUTTER_DIR / "v3_model_48000.pth",
         "https://huggingface.co/Codename0/SmartCutter/resolve/main/v3_model_48000.pth",
+    ),
+    (
+        RSPIN_DIR / "wavlm_rspin_256-40k.pt",
+        "https://data.csail.mit.edu/public-release-sls/rspin/wavlm_rspin_256-40k.pt",
     ),
 ]
 

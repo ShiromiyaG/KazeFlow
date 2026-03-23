@@ -74,6 +74,7 @@ class PreprocessPipeline:
         self.highpass_freq = preprocess_cfg.get("highpass_freq", 48)
         self.target_db = preprocess_cfg.get("target_db", -23.0)
         self.spin_model_name = preprocess_cfg.get("spin_model", "dr87/spinv2_rvc")
+        self.content_embedder_name = preprocess_cfg.get("content_embedder", "spin_v2")
 
         self._spin_model = None
         self._mel_basis = None
@@ -81,19 +82,12 @@ class PreprocessPipeline:
 
     def _get_spin_model(self):
         if self._spin_model is None:
-            from transformers import HubertModel
-            # Prefer the locally downloaded copy; fall back to HF Hub identifier.
-            local_spin = (
-                Path(__file__).parent.parent
-                / "models" / "pretrained" / "embedders" / "spin_v2"
+            from kazeflow.models.embedder import load_content_embedder
+            self._spin_model = load_content_embedder(
+                name=self.content_embedder_name,
+                device=str(self.device),
+                spin_source=self.spin_model_name,
             )
-            spin_source = str(local_spin) if local_spin.exists() else \
-                self.spin_model_name
-            self._spin_model = HubertModel.from_pretrained(
-                spin_source
-            ).to(self.device).eval()
-            for p in self._spin_model.parameters():
-                p.requires_grad_(False)
         return self._spin_model
 
     def _get_mel_basis(self):
@@ -362,6 +356,18 @@ class PreprocessPipeline:
         spin_features = spin_features[:, :min_len]
         f0 = f0[:min_len]
 
+        # ── Energy-gate SPIN embeddings ──────────────────────────────
+        # Zero out SPIN features in frames where the mel energy is near
+        # the silence floor.  This teaches the CFM that silence regions
+        # have null content, preventing it from hallucinating breathing
+        # or tongue artefacts at inference time.
+        mel_energy = mel.mean(dim=0)  # (T,) mean across mel channels
+        silence_floor = float(torch.tensor(1e-5).log().item())  # ≈ -11.5
+        # Soft gate: 0 near floor, 1 for voiced frames
+        energy_above_floor = mel_energy - silence_floor  # positive = above floor
+        gate = torch.sigmoid(energy_above_floor - 1.0)  # centered ~1 dB above floor
+        spin_features = spin_features * gate.unsqueeze(0)  # (C, T) * (1, T)
+
         # ── Save ─────────────────────────────────────────────────────
         np.save(output_dir / "mel" / f"{stem}.npy", mel.cpu().numpy())
         np.save(output_dir / "spin" / f"{stem}.npy",
@@ -410,11 +416,10 @@ class PreprocessPipeline:
 
     @torch.no_grad()
     def _extract_spin(self, audio_16k: torch.Tensor) -> torch.Tensor:
-        """Extract SPIN v2 features from 16kHz audio."""
+        """Extract content features from 16kHz audio (SPIN v2 or RSPIN)."""
         model = self._get_spin_model()
-        outputs = model(audio_16k)
-        features = outputs.last_hidden_state  # (1, T, 768)
-        return features.squeeze(0).T  # (768, T)
+        features = model(audio_16k)  # (1, T, embed_dim)
+        return features.squeeze(0).T  # (embed_dim, T)
 
     def _get_rmvpe(self):
         """Lazy-load and cache the RMVPE predictor."""

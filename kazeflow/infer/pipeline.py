@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import torchaudio
 
 from kazeflow.models.flow_matching import ConditionalFlowMatching
-from kazeflow.models.vocoder import ChouwaGANGenerator
+from kazeflow.models.vocoder import build_vocoder
 from kazeflow.infer.index import load_index, retrieve_and_blend
 
 logger = logging.getLogger("kazeflow.infer")
@@ -51,7 +51,9 @@ class KazeFlowPipeline:
             **model_cfg["flow_matching"]
         ).to(self.device).eval()
 
-        self.vocoder = ChouwaGANGenerator(
+        vocoder_type = model_cfg.get("vocoder_type", "chouwa_gan")
+        self.vocoder = build_vocoder(
+            vocoder_type,
             sr=model_cfg["sample_rate"],
             **model_cfg["vocoder"],
         ).to(self.device).eval()
@@ -95,38 +97,32 @@ class KazeFlowPipeline:
     # ── Feature Extraction ────────────────────────────────────────────────
 
     def _get_spin_model(self):
-        """Lazy-load SPIN v2 (HuBERT) model from local pretrained directory."""
+        """Lazy-load content embedder (SPIN v2 or RSPIN)."""
         if self._spin_model is None:
-            from transformers import HubertModel
-            # Prefer the locally downloaded copy; fall back to HF Hub identifier
-            # so the first-run download (via prerequisites_download) is the norm.
-            local_spin = (
-                Path(__file__).parent.parent
-                / "models" / "pretrained" / "embedders" / "spin_v2"
+            from kazeflow.models.embedder import load_content_embedder
+            embedder_name = self.config.get("preprocess", {}).get(
+                "content_embedder", "spin_v2")
+            spin_source = self.config.get("preprocess", {}).get(
+                "spin_model", "dr87/spinv2_rvc")
+            self._spin_model = load_content_embedder(
+                name=embedder_name,
+                device=str(self.device),
+                spin_source=spin_source,
             )
-            spin_source = str(local_spin) if local_spin.exists() else \
-                self.config.get("preprocess", {}).get("spin_model", "dr87/spinv2_rvc")
-            self._spin_model = HubertModel.from_pretrained(
-                spin_source
-            ).to(self.device).eval()
-            for p in self._spin_model.parameters():
-                p.requires_grad_(False)
         return self._spin_model
 
     def _extract_spin(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Extract SPIN v2 features from 16kHz audio.
+        Extract content features from 16kHz audio (SPIN v2 or RSPIN).
         Args:
             audio: (1, T) at 16kHz
         Returns:
-            features: (1, 768, T_frames)
+            features: (1, embed_dim, T_frames)
         """
         model = self._get_spin_model()
         with torch.no_grad():
-            outputs = model(audio)
-            # Use last hidden state
-            features = outputs.last_hidden_state  # (1, T_frames, 768)
-        return features.transpose(1, 2)  # (1, 768, T_frames)
+            features = model(audio)  # (1, T_frames, embed_dim)
+        return features.transpose(1, 2)  # (1, embed_dim, T_frames)
 
     def _extract_f0(self, audio: torch.Tensor, sr: int,
                     method: str = "rmvpe") -> torch.Tensor:

@@ -7,6 +7,16 @@ if [ ! -d "env" ]; then
     exit 1
 fi
 
+# Suppress PyTorch compile / Triton / inductor noise
+export PYTHONWARNINGS="ignore"
+unset TORCH_LOGS
+export TORCHINDUCTOR_DISABLE_PROGRESS=1
+export TORCHDYNAMO_VERBOSE=0
+export TRITON_DISABLE_LINE_INFO=1
+# Suppress GCC warnings from Triton JIT compilation
+export CC="gcc -w"
+export CXX="g++ -w"
+
 printf "\033]0;KazeFlow\007"
 clear
 

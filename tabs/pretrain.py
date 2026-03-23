@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import shutil
 import threading
 from pathlib import Path
 
@@ -72,10 +73,29 @@ def refresh_pretrain_lists(current_resume: str):
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing
+# Auto schedule
 # ---------------------------------------------------------------------------
 
-def run_pretrain_preprocess(
+def compute_auto_schedule_pretrain(total_epochs: int) -> dict:
+    """Compute smart defaults for warmup/ramp values (pretraining)."""
+    cfm_warmup = max(10, int(total_epochs * 0.10))
+    vocoder_warmup = max(5, int(total_epochs * 0.07))
+    gan_ramp = max(5, min(20, int(total_epochs * 0.05)))
+    ode_ramp = max(20, int((total_epochs - cfm_warmup) * 0.55))
+    return {
+        "cfm_warmup_epochs": cfm_warmup,
+        "vocoder_warmup_epochs": vocoder_warmup,
+        "gan_ramp_epochs": gan_ramp,
+        "ode_ramp_epochs": ode_ramp,
+        "progressive_ode": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing (split: audio slicing + feature extraction)
+# ---------------------------------------------------------------------------
+
+def run_pretrain_audio_preprocess(
     dataset_dir: str,
     model_name: str,
     sample_rate: int,
@@ -90,23 +110,21 @@ def run_pretrain_preprocess(
     use_smart_cutter: bool,
     num_processes: int,
 ):
-    """
-    Run the full two-stage preprocessing pipeline for pretraining:
-      1. Audio slicing / SmartCutter  (preprocess_training_set)
-      2. Feature extraction           (PreprocessPipeline.process_dataset)
-    """
+    """Stage 1: Audio slicing / SmartCutter. Deletes existing sliced audio to redo."""
     global _pretrain_status
     try:
         import multiprocessing
-        import torch
         from kazeflow.preprocess.audio import preprocess_training_set
-        from kazeflow.preprocess.pipeline import PreprocessPipeline
 
         output_dir = Path("logs") / model_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Stage 1: audio slicing ────────────────────────────────────────
-        _pretrain_status = "Stage 1/2: Slicing audio..."
+        sliced_dir = output_dir / "sliced_audios"
+        if sliced_dir.exists():
+            _pretrain_status = "Deleting existing sliced audio to redo..."
+            shutil.rmtree(sliced_dir)
+
+        _pretrain_status = "Slicing audio..."
         n_proc = int(num_processes) if int(num_processes) > 0 else multiprocessing.cpu_count()
 
         preprocess_training_set(
@@ -125,18 +143,47 @@ def run_pretrain_preprocess(
             use_smart_cutter=bool(use_smart_cutter),
         )
 
-        # ── Stage 2: feature extraction ───────────────────────────────────
-        _pretrain_status = "Stage 2/2: Extracting features..."
+        n_files = len(list(sliced_dir.glob("*.wav"))) if sliced_dir.exists() else 0
+        _pretrain_status = f"Audio preprocessing complete! {n_files} sliced files."
+        return _pretrain_status
 
-        sr_map = {32000: "32k", 40000: "40k", 44100: "44k", 48000: "48k"}
-        cfg_dir = Path(__file__).parent.parent / "kazeflow" / "configs"
-        cfg_name = sr_map.get(int(sample_rate), "48k")
-        config_path = cfg_dir / f"{cfg_name}.json"
+    except Exception as e:
+        _pretrain_status = f"Audio preprocessing failed: {e}"
+        logger.exception("Audio preprocessing failed")
+        return _pretrain_status
 
-        with open(config_path, "r") as f:
-            config = json.load(f)
 
+def run_pretrain_feature_extraction(
+    model_name: str,
+    sample_rate: int,
+    content_embedder: str = "rspin",
+):
+    """Stage 2: Extract embeddings, pitch, mel. Deletes existing features to redo."""
+    global _pretrain_status
+    try:
+        import torch
+        from kazeflow.preprocess.pipeline import PreprocessPipeline
+
+        output_dir = Path("logs") / model_name
         sliced_dir = output_dir / "sliced_audios"
+
+        if not sliced_dir.exists() or not any(sliced_dir.glob("*.wav")):
+            _pretrain_status = "Error: No sliced audio found. Run 'Preprocess Audio' first."
+            return _pretrain_status
+
+        # Delete existing feature dirs to force re-extraction
+        for feat_dir in ("spin", "f0", "mel"):
+            feat_path = output_dir / feat_dir
+            if feat_path.exists():
+                _pretrain_status = f"Deleting existing {feat_dir}/ to redo..."
+                shutil.rmtree(feat_path)
+
+        _pretrain_status = "Extracting embeddings, pitch & mel..."
+
+        from kazeflow.configs import load_config
+        config = load_config(sample_rate=int(sample_rate))
+
+        config["preprocess"]["content_embedder"] = content_embedder
 
         pipeline = PreprocessPipeline(
             config=config,
@@ -147,6 +194,10 @@ def run_pretrain_preprocess(
             output_dir=str(output_dir),
         )
 
+        # Save config so training can pick it up later
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(config, f, indent=2)
+
         info_path = output_dir / "model_info.json"
         if info_path.exists():
             with open(info_path) as f:
@@ -154,17 +205,17 @@ def run_pretrain_preprocess(
             n_spk = info.get("n_speakers", "?")
             total = info.get("total_samples", "?")
             _pretrain_status = (
-                f"Preprocessing complete! "
+                f"Feature extraction complete! "
                 f"{total} samples, {n_spk} speaker(s) detected."
             )
         else:
-            _pretrain_status = "Preprocessing complete!"
+            _pretrain_status = "Feature extraction complete!"
 
         return _pretrain_status
 
     except Exception as e:
-        _pretrain_status = f"Preprocessing failed: {e}"
-        logger.exception("Preprocessing failed")
+        _pretrain_status = f"Feature extraction failed: {e}"
+        logger.exception("Feature extraction failed")
         return _pretrain_status
 
 
@@ -185,15 +236,24 @@ def stop_pretraining():
 def start_pretraining(
     model_name: str,
     sample_rate: int,
-    precision: str,
-    torch_compile: bool,
-    compile_mode: str,
-    gan_loss_type: str,
     batch_size: int,
     save_every: int,
     epochs: int,
     cfm_warmup_epochs: int,
     resume_path: str,
+    content_embedder: str,
+    architecture: str,
+    # Advanced
+    precision: str,
+    torch_compile: bool,
+    compile_mode: str,
+    lr_scheduler: str,
+    gan_loss_type: str,
+    vocoder_warmup: int,
+    gan_ramp_epochs: int,
+    progressive_ode: bool,
+    ode_ramp_epochs: int,
+    auto_schedule: bool,
 ):
     """Start pretraining in a background thread."""
     global _pretrain_thread, _pretrain_status
@@ -201,11 +261,10 @@ def start_pretraining(
     if _pretrain_thread is not None and _pretrain_thread.is_alive():
         return "Pretraining already in progress!"
 
-    _stop_event.clear()  # Reset stop flag before starting
+    _stop_event.clear()
 
     def _train_fn():
         global _pretrain_status
-        # Redirect inductor autotune cache to SSD — /tmp is a tmpfs and fills up fast
         os.environ.setdefault(
             "TORCHINDUCTOR_CACHE_DIR",
             str(Path.home() / ".cache" / "torchinductor"),
@@ -213,38 +272,52 @@ def start_pretraining(
         try:
             _pretrain_status = "Loading config..."
 
-            sr_map = {32000: "32k", 40000: "40k", 44100: "44k", 48000: "48k"}
+            is_v2 = architecture == "v2"
             cfg_dir = Path(__file__).parent.parent / "kazeflow" / "configs"
-            cfg_name = sr_map.get(sample_rate, "48k")
-            config_path = cfg_dir / f"{cfg_name}.json"
 
             experiment_dir = Path("logs") / model_name
             existing_cfg = experiment_dir / "config.json"
 
-            # Prefer existing experiment config (preserves manual edits like
-            # n_disc_steps, c_r1, reset_gan_optimizers, etc.) over the
-            # template. Fall back to the template for new experiments.
             if existing_cfg.exists():
                 with open(existing_cfg, "r") as f:
                     config = json.load(f)
                 logger.info(f"Loaded existing config from {existing_cfg}")
             else:
-                with open(config_path, "r") as f:
-                    config = json.load(f)
+                from kazeflow.configs import load_config
+                preset = "pretrain_v2" if is_v2 else "pretrain"
+                config = load_config(sample_rate=sample_rate, preset=preset)
 
-            # Apply UI overrides (always take effect regardless of saved config)
+            # Apply UI overrides
             config["train"]["precision"] = precision
             config["train"]["torch_compile"] = torch_compile
             config["train"]["compile_mode"] = compile_mode
+            config["train"]["lr_scheduler"] = lr_scheduler
             config["train"]["gan_loss_type"] = gan_loss_type
+            config["preprocess"]["content_embedder"] = content_embedder
+
+            from kazeflow.models.embedder import EMBEDDER_DIMS
+            config["model"]["flow_matching"]["cond_channels"] = EMBEDDER_DIMS[content_embedder]
+
             if batch_size > 0:
                 config["train"]["batch_size"] = batch_size
             if save_every > 0:
                 config["train"]["save_every"] = save_every
             if epochs > 0:
                 config["train"]["epochs"] = epochs
-            if cfm_warmup_epochs >= 0:
-                config["train"]["cfm_warmup_epochs"] = cfm_warmup_epochs
+
+            # Auto schedule or manual overrides
+            _total = config["train"]["epochs"]
+            if auto_schedule:
+                sched = compute_auto_schedule_pretrain(_total)
+                for k, v in sched.items():
+                    config["train"][k] = v
+            else:
+                if cfm_warmup_epochs >= 0:
+                    config["train"]["cfm_warmup_epochs"] = int(cfm_warmup_epochs)
+                config["train"]["vocoder_warmup_epochs"] = int(vocoder_warmup)
+                config["train"]["gan_ramp_epochs"] = int(gan_ramp_epochs)
+                config["train"]["progressive_ode"] = progressive_ode
+                config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
 
             filelist_path = experiment_dir / "filelist.txt"
 
@@ -276,19 +349,35 @@ def start_pretraining(
                 config["model"]["n_speakers"] = max(len(speaker_ids), 1)
 
             import torch
-            from kazeflow.train.pretrain import KazeFlowPretrainer
 
-            _pretrain_status = (
-                f"Initializing pretrainer "
-                f"({config['model']['n_speakers']} speakers)..."
-            )
-            output_dir = str(experiment_dir)
+            if is_v2:
+                from kazeflow.train.pretrain_v2 import KazeFlowV2Pretrainer
 
-            pretrainer = KazeFlowPretrainer(
-                config=config,
-                output_dir=output_dir,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-            )
+                _pretrain_status = (
+                    f"Initializing AFM v2 pretrainer "
+                    f"({config['model']['n_speakers']} speakers)..."
+                )
+                output_dir = str(experiment_dir)
+
+                pretrainer = KazeFlowV2Pretrainer(
+                    config=config,
+                    output_dir=output_dir,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                )
+            else:
+                from kazeflow.train.pretrain import KazeFlowPretrainer
+
+                _pretrain_status = (
+                    f"Initializing pretrainer "
+                    f"({config['model']['n_speakers']} speakers)..."
+                )
+                output_dir = str(experiment_dir)
+
+                pretrainer = KazeFlowPretrainer(
+                    config=config,
+                    output_dir=output_dir,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                )
 
             resume = resume_path if resume_path and resume_path.strip() else None
 
@@ -325,7 +414,7 @@ def create_pretrain_tab():
     """Build the pretraining Gradio tab."""
     with gr.Tab("Pretrain"):
         gr.Markdown(
-            "## 🎓 Pretrain a Base Model\n"
+            "## Pretrain a Base Model\n"
             "Train a multi-speaker base that can be fine-tuned for any voice.\n\n"
             "> **Dataset layout:** Subdirectories `0/`, `1/`, `2/`... for multi-speaker — "
             "each folder holds one speaker's audio."
@@ -345,14 +434,20 @@ def create_pretrain_tab():
                 )
                 refresh_btn = gr.Button("🔄 Refresh", size="sm", min_width=80, scale=0)
             sample_rate = gr.Radio(
-                label="Sample Rate",
-                choices=[32000, 40000, 44100, 48000],
-                value=32000,
-                info="Must match between Preprocess and Pretraining.",
+                    label="Sample Rate",
+                    choices=[32000, 40000, 44100, 48000],
+                    value=32000,
+                    info="Must match between Preprocess and Pretraining.",
+                )
+            architecture = gr.Radio(
+                label="Architecture",
+                choices=["v1", "v2"],
+                value="v2",
+                info="v1: Flow Matching + ChouwaGAN. v2: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
             )
 
-        # ── 1. Preprocess ────────────────────────────────────────────────
-        with gr.Accordion("1 · Preprocess & Extract Features", open=True):
+        # ── 1. Preprocess Audio ──────────────────────────────────────────
+        with gr.Accordion("1 · Preprocess Audio", open=True):
             dataset_dir = gr.Dropdown(
                 label="Dataset Directory",
                 choices=get_datasets_list(),
@@ -372,21 +467,16 @@ def create_pretrain_tab():
                     label="Normalization",
                     choices=["none", "post_peak"],
                     value="post_peak",
-                    info="Peak-normalize each slice.",
                 )
 
             with gr.Row():
                 chunk_len = gr.Number(
-                    label="Chunk Length (s)",
-                    value=3.0, minimum=0.1,
+                    label="Chunk Length (s)", value=3.0, minimum=0.1,
                     info="Used in Simple mode.",
-                    visible=True,
                 )
                 overlap_len = gr.Number(
-                    label="Overlap Length (s)",
-                    value=0.3, minimum=0.0,
+                    label="Overlap Length (s)", value=0.3, minimum=0.0,
                     info="Used in Simple mode.",
-                    visible=True,
                 )
 
             with gr.Row():
@@ -396,25 +486,21 @@ def create_pretrain_tab():
                     value="librosa",
                 )
                 num_processes = gr.Number(
-                    label="Worker Processes",
-                    value=0, precision=0, minimum=0,
+                    label="Worker Processes", value=0, precision=0, minimum=0,
                     info="0 = auto (CPU count)",
                 )
 
             with gr.Row():
                 process_effects = gr.Checkbox(
-                    label="High-pass filter",
-                    value=True,
+                    label="High-pass filter", value=True,
                     info="48 Hz HPF to remove DC / sub-bass rumble.",
                 )
                 noise_reduction = gr.Checkbox(
-                    label="Noise reduction",
-                    value=False,
-                    info="Spectral noise reduction (noisereduce).",
+                    label="Noise reduction", value=False,
+                    info="Spectral noise reduction.",
                 )
                 use_smart_cutter = gr.Checkbox(
-                    label="SmartCutter",
-                    value=True,
+                    label="SmartCutter", value=True,
                     info="Silence removal before slicing (requires GPU).",
                 )
 
@@ -424,40 +510,26 @@ def create_pretrain_tab():
                 visible=False,
             )
 
-            preprocess_btn = gr.Button("▶ Preprocess & Extract Features", variant="primary")
-            preprocess_status = gr.Textbox(label="Status", interactive=False, lines=2)
+            preprocess_btn = gr.Button("▶ Preprocess Audio", variant="primary")
+            preprocess_status = gr.Textbox(label="Status", interactive=False, lines=1)
 
-        # ── 2. Pretraining ───────────────────────────────────────────────
-        with gr.Accordion("2 · Pretraining", open=True):
-            with gr.Group():
-                gr.Markdown("#### Precision & Compilation")
-                precision = gr.Radio(
-                    label="Precision",
-                    choices=["fp32", "fp16", "bf16", "tf32", "tf32_fp16", "tf32_bf16"],
-                    value="tf32_bf16",
-                    info="bf16: BF16 AMP · tf32: TensorFloat-32 (Ampere+) · tf32_bf16: recommended (Ampere+)",
-                )
-                with gr.Row():
-                    torch_compile = gr.Checkbox(
-                        label="torch.compile",
-                        value=False,
-                        info="~10–30% speedup (PyTorch 2.0+).",
-                    )
-                    compile_mode = gr.Dropdown(
-                        label="Compile Mode",
-                        choices=["default", "max-autotune-no-cudagraphs"],
-                        value="max-autotune-no-cudagraphs",
-                        info="max-autotune-no-cudagraphs: kernel autotuning (slow first run).",
-                    )
-                with gr.Group():
-                    gr.Markdown("#### GAN Loss")
-                    gan_loss_type = gr.Dropdown(
-                        label="GAN Loss Type",
-                        choices=["hinge", "soft_hinge", "lsgan"],
-                        value="soft_hinge",
-                        info="Hinge: margin ±1, const grad −1 (BigVGAN) · Soft Hinge: disc=hinge, gen=softplus(-D) · LSGAN: quadratic targets 0/1.",
-                    )
+        # ── 2. Extract Embeddings & Pitch ────────────────────────────────
+        with gr.Accordion("2 · Extract Embeddings & Pitch", open=True):
+            gr.Markdown(
+                "Extract content embeddings (SPIN/RSPIN), F0 pitch, and mel spectrograms. "
+                "Re-running will delete existing features and redo extraction."
+            )
+            content_embedder = gr.Dropdown(
+                label="Content Embedder",
+                choices=["spin_v2", "rspin"],
+                value="rspin",
+                info="SPIN v2: HuBERT-based. RSPIN: WavLM-based (recommended).",
+            )
+            extract_btn = gr.Button("▶ Extract Features", variant="primary")
+            extract_status = gr.Textbox(label="Status", interactive=False, lines=1)
 
+        # ── 3. Pretraining ───────────────────────────────────────────────
+        with gr.Accordion("3 · Pretraining", open=True):
             with gr.Group():
                 gr.Markdown("#### Schedule")
                 with gr.Row():
@@ -469,13 +541,14 @@ def create_pretrain_tab():
                         label="Save Every (epochs)", value=1, precision=0, minimum=0,
                         info="0 = config default",
                     )
+                with gr.Row():
                     total_epochs = gr.Number(
-                        label="Total Epochs", value=500, precision=0, minimum=0,
+                        label="Total Epochs", value=200, precision=0, minimum=0,
                         info="0 = config default",
                     )
                     cfm_warmup = gr.Number(
-                        label="CFM Warmup Epochs", value=10, precision=0, minimum=-1,
-                        info="-1 = config default · Phase 1: train flow only",
+                        label="CFM Warmup (epochs)", value=20, precision=0, minimum=-1,
+                        info="-1 = config default. CFM-only phase before vocoder.",
                     )
 
             with gr.Group():
@@ -483,9 +556,82 @@ def create_pretrain_tab():
                 resume_ckpt = gr.Dropdown(
                     label="Resume Checkpoint (optional)",
                     choices=get_pretrain_checkpoints_list(),
+                    value=None,
                     interactive=True, allow_custom_value=True,
-                    info="Continue from a previous run. Leave empty to start fresh.",
+                    info="Continue from a previous run.",
                 )
+
+            # ── Advanced Settings ────────────────────────────────────
+            with gr.Accordion("⚙ Advanced Settings", open=False):
+                with gr.Group():
+                    gr.Markdown("#### Precision & Compilation")
+                    precision = gr.Radio(
+                        label="Precision",
+                        choices=["fp32", "fp16", "bf16", "tf32", "tf32_fp16", "tf32_bf16"],
+                        value="tf32_bf16",
+                        info="tf32_bf16: recommended for Ampere+ GPUs.",
+                    )
+                    with gr.Row():
+                        torch_compile = gr.Checkbox(
+                            label="torch.compile", value=True,
+                            info="~10–30% speedup (PyTorch 2.0+).",
+                        )
+                        compile_mode = gr.Dropdown(
+                            label="Compile Mode",
+                            choices=[
+                                "default",
+                                "reduce-overhead",
+                                "max-autotune-no-cudagraphs",
+                                "max-autotune",
+                            ],
+                            value="max-autotune-no-cudagraphs",
+                        )
+
+                with gr.Group():
+                    gr.Markdown("#### LR & GAN")
+                    with gr.Row():
+                        lr_scheduler = gr.Dropdown(
+                            label="LR Scheduler",
+                            choices=["exponential", "cosine"],
+                            value="cosine",
+                            info="cosine: better convergence for long runs.",
+                        )
+                        gan_loss_type = gr.Dropdown(
+                            label="GAN Loss Type",
+                            choices=["hinge", "soft_hinge", "lsgan"],
+                            value="soft_hinge",
+                            info="soft_hinge: recommended (softplus disc for SAN).",
+                        )
+
+                with gr.Group():
+                    gr.Markdown("#### Warmup & Ramp")
+                    auto_schedule = gr.Checkbox(
+                        label="Auto Schedule",
+                        value=True,
+                        info="Automatically compute warmup/ramp values from total epochs.",
+                    )
+                    with gr.Row():
+                        vocoder_warmup = gr.Number(
+                            label="Vocoder Warmup (epochs)", value=13, precision=0,
+                            minimum=0, interactive=False,
+                            info="Mel-only vocoder phase before GAN activates.",
+                        )
+                        gan_ramp_epochs = gr.Number(
+                            label="GAN Ramp (epochs)", value=10, precision=0,
+                            minimum=0, interactive=False,
+                            info="Ramp GAN loss 0→1 over N epochs.",
+                        )
+                    with gr.Row():
+                        progressive_ode = gr.Checkbox(
+                            label="Progressive ODE", value=True,
+                            interactive=False,
+                            info="Ramp ODE steps from min→max over ode_ramp_epochs.",
+                        )
+                        ode_ramp_epochs = gr.Number(
+                            label="ODE Ramp (epochs)", value=100, precision=0,
+                            minimum=0, interactive=False,
+                            info="Epochs to ramp ODE steps.",
+                        )
 
             with gr.Row():
                 train_btn = gr.Button("▶ Start Pretraining", variant="primary")
@@ -512,8 +658,24 @@ def create_pretrain_tab():
             inputs=[noise_reduction],
             outputs=[reduction_strength],
         )
+
+        # Auto schedule toggle: enable/disable manual warmup fields
+        def _toggle_auto(enabled):
+            interactive = not enabled
+            return (
+                gr.update(interactive=interactive),
+                gr.update(interactive=interactive),
+                gr.update(interactive=interactive),
+                gr.update(interactive=interactive),
+            )
+        auto_schedule.change(
+            fn=_toggle_auto,
+            inputs=[auto_schedule],
+            outputs=[vocoder_warmup, gan_ramp_epochs, progressive_ode, ode_ramp_epochs],
+        )
+
         preprocess_btn.click(
-            fn=run_pretrain_preprocess,
+            fn=run_pretrain_audio_preprocess,
             inputs=[
                 dataset_dir, model_name, sample_rate,
                 cut_preprocess, process_effects, noise_reduction,
@@ -523,11 +685,23 @@ def create_pretrain_tab():
             ],
             outputs=[preprocess_status],
         )
+        extract_btn.click(
+            fn=run_pretrain_feature_extraction,
+            inputs=[model_name, sample_rate, content_embedder],
+            outputs=[extract_status],
+        )
         train_btn.click(
             fn=start_pretraining,
-            inputs=[model_name, sample_rate, precision, torch_compile,
-                    compile_mode, gan_loss_type, batch_size, save_every,
-                    total_epochs, cfm_warmup, resume_ckpt],
+            inputs=[model_name, sample_rate,
+                    batch_size, save_every, total_epochs,
+                    cfm_warmup, resume_ckpt, content_embedder,
+                    architecture,
+                    # Advanced
+                    precision, torch_compile, compile_mode,
+                    lr_scheduler, gan_loss_type,
+                    vocoder_warmup, gan_ramp_epochs,
+                    progressive_ode, ode_ramp_epochs,
+                    auto_schedule],
             outputs=[train_status],
         )
         stop_btn.click(fn=stop_pretraining, outputs=[train_status])

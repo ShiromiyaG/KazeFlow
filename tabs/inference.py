@@ -200,7 +200,7 @@ def run_inference(
 def create_inference_tab():
     """Build the inference Gradio tab."""
     with gr.Tab("Inference"):
-        gr.Markdown("## 🎙 Voice Conversion")
+        gr.Markdown("## Voice Conversion")
 
         with gr.Row(equal_height=False):
             # ── Left: Input ───────────────────────────────────────────

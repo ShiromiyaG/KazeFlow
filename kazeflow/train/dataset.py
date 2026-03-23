@@ -10,7 +10,7 @@ Expected file structure after preprocessing:
         mel/                  # Mel spectrograms (.npy, shape [n_mels, T])
 
 Mute entries (stem == "mute") are loaded from the shared mute directory
-``logs/mute_spin_v2/`` instead of the model's feature directories.
+``logs/mute_spin_v2/`` or ``logs/mute_rspin/`` depending on the content embedder.
 """
 
 import logging
@@ -29,7 +29,10 @@ logger = logging.getLogger("kazeflow.dataset")
 
 # Shared mute feature directory (generated once at startup by generate_mutes.py)
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
-_MUTE_DIR = _PROJECT_ROOT / "logs" / "mute_spin_v2"
+_MUTE_DIRS = {
+    "spin_v2": _PROJECT_ROOT / "logs" / "mute_spin_v2",
+    "rspin":   _PROJECT_ROOT / "logs" / "mute_rspin",
+}
 
 
 class KazeFlowDataset(Dataset):
@@ -55,6 +58,7 @@ class KazeFlowDataset(Dataset):
         hop_length: int = 480,
         sample_rate: int = 48000,
         skip_wav: bool = False,
+        content_embedder: str = "spin_v2",
     ):
         self.dataset_root = Path(dataset_root)
         self.segment_frames = segment_frames
@@ -62,6 +66,7 @@ class KazeFlowDataset(Dataset):
         self.hop_length = hop_length
         self.sample_rate = sample_rate
         self.skip_wav = skip_wav
+        self.mute_dir = _MUTE_DIRS.get(content_embedder, _MUTE_DIRS["spin_v2"])
 
         # Parse filelist
         self.entries = []
@@ -103,7 +108,7 @@ class KazeFlowDataset(Dataset):
 
         # Mute entries are stored in the shared mute directory, not the model dir.
         if stem == "mute":
-            feature_root = _MUTE_DIR
+            feature_root = self.mute_dir
         else:
             feature_root = self.dataset_root
 
@@ -197,6 +202,7 @@ def create_dataloader(
     pin_memory: bool = True,
     shuffle: bool = True,
     skip_wav: bool = False,
+    content_embedder: str = "spin_v2",
 ) -> DataLoader:
     dataset = KazeFlowDataset(
         filelist_path=filelist_path,
@@ -206,6 +212,7 @@ def create_dataloader(
         hop_length=hop_length,
         sample_rate=sample_rate,
         skip_wav=skip_wav,
+        content_embedder=content_embedder,
     )
     return DataLoader(
         dataset,

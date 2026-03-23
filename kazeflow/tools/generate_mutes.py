@@ -9,16 +9,22 @@ Output layout::
 
     logs/mute_spin_v2/
         sliced_audios/
-            mute32000.wav
-            mute40000.wav
-            mute44100.wav
-            mute48000.wav
+            mute32000.wav  …
         spin/
             mute.npy          # (T_spin, 768) float32 — SPIN v2 on 3s silence @ 48k
         f0/
             mute.npy          # (T_f0,)  float64 — all zeros (unvoiced)
         mel/
             mute.npy          # (n_mels, T_mel) float32 — log-mel of silence
+
+    logs/mute_rspin/
+        sliced_audios/ …     # same wavs
+        spin/
+            mute.npy          # (T_spin, 256) float32 — RSPIN on 3s silence @ 48k
+        f0/
+            mute.npy          # same as spin_v2
+        mel/
+            mute.npy          # same as spin_v2
 
 The spin / f0 / mel arrays are derived from a 3-second silence clip at 48 kHz
 (the most common target SR).  The same mute.npy files are reused regardless of
@@ -53,7 +59,10 @@ _HERE = Path(__file__).parent
 _ROOT = _HERE.parent  # kazeflow/tools/ -> kazeflow/ -> project root (wrong; see below)
 # tools/ is inside kazeflow/; project root is two levels up
 _ROOT = _HERE.parent.parent  # project root
-_MUTE_DIR = _ROOT / "logs" / "mute_spin_v2"
+_MUTE_DIRS = {
+    "spin_v2": _ROOT / "logs" / "mute_spin_v2",
+    "rspin":   _ROOT / "logs" / "mute_rspin",
+}
 
 _SPIN_V2_DIR = _ROOT / "kazeflow" / "models" / "pretrained" / "embedders" / "spin_v2"
 _RMVPE_PATH = (
@@ -80,35 +89,27 @@ def _save_wav(path: Path, audio: np.ndarray, sr: int) -> None:
     logger.info("Saved %s", path)
 
 
-def _generate_spin(silence_48k: np.ndarray, device: str) -> np.ndarray:
+def _generate_spin(silence_48k: np.ndarray, device: str, embedder_name: str = "spin_v2") -> np.ndarray:
     """
-    Run SPIN v2 on the silence clip and return (T, 768) float32.
+    Run content embedder on the silence clip and return (T, D) float32.
+    D = 768 for spin_v2, 256 for rspin.
     """
-    from transformers import HubertModel
+    from kazeflow.models.embedder import load_content_embedder
 
-    if _SPIN_V2_DIR.exists():
-        source = str(_SPIN_V2_DIR)
-    else:
-        source = "dr87/spinv2_rvc"
-        logger.warning("Local SPIN v2 not found at %s; using HF Hub.", _SPIN_V2_DIR)
+    model = load_content_embedder(name=embedder_name, device=device)
 
-    logger.info("Loading SPIN v2 from %s…", source)
-    model = HubertModel.from_pretrained(source).to(device).float().eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    # SPIN v2 expects 16 kHz
+    # Content embedders expect 16 kHz
     audio_16k = torchaudio.functional.resample(
         torch.from_numpy(silence_48k).unsqueeze(0), _PRIMARY_SR, 16000
     ).to(device)
 
     with torch.no_grad():
-        out = model(audio_16k)
-    features = out.last_hidden_state.squeeze(0).float().cpu().numpy()  # (T, 768)
-    logger.info("SPIN v2 mute shape: %s", features.shape)
+        features = model(audio_16k)  # (1, T, 768)
+    features = features.squeeze(0).float().cpu().numpy()  # (T, 768)
+    logger.info("Mute embedding shape: %s", features.shape)
 
-    # Free SPIN v2 from GPU before returning.
-    del model, out, audio_16k
+    # Free model from GPU before returning.
+    del model, audio_16k
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -198,62 +199,71 @@ def _generate_mel(silence_48k: np.ndarray, config: dict, device: str) -> np.ndar
 
 def generate_mutes(device: str = "cpu", force: bool = False) -> None:
     """
-    Generate all mute files under logs/mute_spin_v2/.
+    Generate all mute files under logs/mute_spin_v2/ and logs/mute_rspin/.
 
     Args:
         device: PyTorch device to use for model inference.
         force:  Overwrite existing files even if they already exist.
     """
-    # Check if already done
-    spin_path = _MUTE_DIR / "spin" / "mute.npy"
-    f0_path = _MUTE_DIR / "f0" / "mute.npy"
-    mel_path = _MUTE_DIR / "mel" / "mute.npy"
-    wav_path = _MUTE_DIR / "sliced_audios" / f"mute{_PRIMARY_SR}.wav"
-
-    all_exist = all(p.exists() for p in (spin_path, f0_path, mel_path, wav_path))
-    if all_exist and not force:
-        logger.info("Mute files already present at %s — skipping.", _MUTE_DIR)
-        return
-
     # Load 48k config for mel parameters
-    cfg_path = _CONFIGS_DIR / "48k.json"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
-    with open(cfg_path) as f:
-        config = json.load(f)
+    from kazeflow.configs import load_config
+    config = load_config(48000)
 
     silence_48k = _make_silence(_PRIMARY_SR, _MUTE_DURATION_S)
 
-    # ── WAV files (all SRs) ───────────────────────────────────────────────
-    for sr in _ALL_SRS:
-        wav = _MUTE_DIR / "sliced_audios" / f"mute{sr}.wav"
-        if not wav.exists() or force:
-            if sr == _PRIMARY_SR:
-                _save_wav(wav, silence_48k, sr)
-            else:
-                silence_sr = _make_silence(sr, _MUTE_DURATION_S)
-                _save_wav(wav, silence_sr, sr)
+    # F0 and mel are shared (embedder-independent) — compute once, reuse.
+    f0_arr: np.ndarray | None = None
+    mel_arr: np.ndarray | None = None
 
-    # ── SPIN v2 features ──────────────────────────────────────────────────
-    if not spin_path.exists() or force:
-        spin_features = _generate_spin(silence_48k, device)
-        spin_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(spin_path, spin_features, allow_pickle=False)
-        logger.info("Saved %s %s", spin_path, spin_features.shape)
+    for embedder_name, mute_dir in _MUTE_DIRS.items():
+        spin_path = mute_dir / "spin" / "mute.npy"
+        f0_path = mute_dir / "f0" / "mute.npy"
+        mel_path = mute_dir / "mel" / "mute.npy"
+        wav_path = mute_dir / "sliced_audios" / f"mute{_PRIMARY_SR}.wav"
 
-    # ── F0 ────────────────────────────────────────────────────────────────
-    if not f0_path.exists() or force:
-        f0 = _generate_f0(silence_48k, device)
-        f0_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(f0_path, f0, allow_pickle=False)
-        logger.info("Saved %s %s", f0_path, f0.shape)
+        all_exist = all(p.exists() for p in (spin_path, f0_path, mel_path, wav_path))
+        if all_exist and not force:
+            logger.info("Mute files already present at %s — skipping.", mute_dir)
+            continue
 
-    # ── Mel ───────────────────────────────────────────────────────────────
-    if not mel_path.exists() or force:
-        mel = _generate_mel(silence_48k, config, device)
-        mel_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(mel_path, mel, allow_pickle=False)
-        logger.info("Saved %s %s", mel_path, mel.shape)
+        logger.info("Generating mute files for %s…", embedder_name)
+
+        # ── WAV files (all SRs) ───────────────────────────────────────────
+        for sr in _ALL_SRS:
+            wav = mute_dir / "sliced_audios" / f"mute{sr}.wav"
+            if not wav.exists() or force:
+                if sr == _PRIMARY_SR:
+                    _save_wav(wav, silence_48k, sr)
+                else:
+                    silence_sr = _make_silence(sr, _MUTE_DURATION_S)
+                    _save_wav(wav, silence_sr, sr)
+
+        # ── Content embedder features ─────────────────────────────────────
+        if not spin_path.exists() or force:
+            spin_features = _generate_spin(silence_48k, device, embedder_name)
+            # Zero out embeddings for silence — consistent with energy gate
+            # applied during preprocessing (pipeline.py).  Teaches the CFM
+            # that null embeddings → silent mel.
+            spin_features = np.zeros_like(spin_features)
+            spin_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(spin_path, spin_features, allow_pickle=False)
+            logger.info("Saved %s %s (zeroed for silence)", spin_path, spin_features.shape)
+
+        # ── F0 (shared — compute once) ────────────────────────────────────
+        if not f0_path.exists() or force:
+            if f0_arr is None:
+                f0_arr = _generate_f0(silence_48k, device)
+            f0_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(f0_path, f0_arr, allow_pickle=False)
+            logger.info("Saved %s %s", f0_path, f0_arr.shape)
+
+        # ── Mel (shared — compute once) ───────────────────────────────────
+        if not mel_path.exists() or force:
+            if mel_arr is None:
+                mel_arr = _generate_mel(silence_48k, config, device)
+            mel_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(mel_path, mel_arr, allow_pickle=False)
+            logger.info("Saved %s %s", mel_path, mel_arr.shape)
 
     logger.info("Mute file generation complete.")
 

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/images/logo.png" alt="KazeFlow" width="480">
+</p>
+
 # KazeFlow
 
 KazeFlow is a voice conversion system with a web interface. Feed it audio from any speaker and it converts it to the timbre of a trained model, preserving the original content and intonation.

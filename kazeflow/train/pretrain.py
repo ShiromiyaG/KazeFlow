@@ -38,13 +38,14 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from kazeflow.models.flow_matching import ConditionalFlowMatching
-from kazeflow.models.vocoder import ChouwaGANGenerator, EMAGenerator
-from kazeflow.models.discriminator import ChouwaGANDiscriminator
+from kazeflow.models.vocoder import build_vocoder, EMAGenerator
+from kazeflow.models.discriminator import build_discriminator
 from kazeflow.train.dataset import create_dataloader
 from kazeflow.train.losses import (
     LeCamEMA,
     discriminator_loss_lsgan,
     discriminator_loss_hinge,
+    discriminator_loss_softplus,
     feature_loss,
     generator_loss_lsgan,
     generator_loss_hinge,
@@ -55,6 +56,9 @@ from kazeflow.train.losses import (
 )
 
 logger = logging.getLogger("kazeflow.pretrain")
+
+def _log_section(title: str) -> None:
+    logger.info(f"── {title} {'─' * max(1, 45 - len(title))}")
 
 
 def plot_spectrogram_to_numpy(spectrogram: np.ndarray) -> np.ndarray:
@@ -108,6 +112,7 @@ class KazeFlowPretrainer:
                 json.dump(config, f, indent=2)
 
         # ── Precision ────────────────────────────────────────────────────
+        _log_section("Precision")
         precision = train_cfg.get("precision", "fp32").lower()
         self.use_amp = False
         self.amp_dtype = torch.float32
@@ -167,17 +172,33 @@ class KazeFlowPretrainer:
         # GradScaler is only needed for FP16 (BF16 has full FP32 dynamic range)
         self._needs_scaler = (self.use_amp and self.amp_dtype == torch.float16)
 
+        # ── Extra CUDA performance knobs ────────────────────────────────
+        # cudnn.benchmark: auto-tunes cuDNN conv algorithms for fixed input
+        # sizes — free speed-up since segment_frames is always constant.
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            logger.info("cuDNN benchmark mode enabled")
+        # float32_matmul_precision: tells PyTorch to prefer TF32 for all
+        # float32 matmuls (complements allow_tf32 for Ampere+ GPUs).
+        if _has_tf32():
+            torch.set_float32_matmul_precision("high")
+            logger.info("float32 matmul precision set to 'high' (TF32, Ampere+)")
+
         # ── Models ───────────────────────────────────────────────────────
         self.flow = ConditionalFlowMatching(
             **model_cfg["flow_matching"]
         ).to(self.device)
 
-        self.vocoder = ChouwaGANGenerator(
+        vocoder_type = model_cfg.get("vocoder_type", "chouwa_gan")
+        self.vocoder = build_vocoder(
+            vocoder_type,
             sr=model_cfg["sample_rate"],
             **model_cfg["vocoder"],
         ).to(self.device)
 
-        self.discriminator = ChouwaGANDiscriminator(
+        disc_type = model_cfg.get("discriminator_type", vocoder_type)
+        self.discriminator = build_discriminator(
+            disc_type,
             sample_rate=model_cfg["sample_rate"],
             **model_cfg["discriminator"],
         ).to(self.device)
@@ -186,19 +207,15 @@ class KazeFlowPretrainer:
         spk_dim = model_cfg.get("speaker_embed_dim", 256)
         self.speaker_embed = nn.Embedding(n_speakers, spk_dim).to(self.device)
 
-        # ── Per-layer gradient clip on conv_post ─────────────────────────
-        # conv_post (the final 1-d conv) receives ~97% of adversarial gradient
-        # norm because it's closest to the discriminator.  Without per-layer
-        # clipping it dominates the global norm, causing heavy global clip that
-        # starves deeper layers of gradient signal.
+        # ── Per-layer gradient clip on vocoder output layer ────────────
+        _log_section("Compilation")
+        # The vocoder output layer receives the bulk of adversarial gradient
+        # norm. Per-layer clipping prevents it from dominating the global norm
+        # and starving deeper layers of gradient signal.
         _cp_clip = train_cfg.get("conv_post_grad_clip", 0.0)
-        if _cp_clip > 0:
-            def _clip_hook(grad, _max=_cp_clip):
-                gn = grad.norm()
-                return grad * (_max / gn) if gn > _max else grad
-            for p in self.vocoder.head.conv_post.parameters():
-                p.register_hook(_clip_hook)
-            logger.info(f"conv_post per-layer gradient clip: {_cp_clip}")
+        if _cp_clip > 0 and hasattr(self.vocoder, "register_output_grad_clip"):
+            self.vocoder.register_output_grad_clip(_cp_clip)
+            logger.info(f"Vocoder output layer per-param gradient clip: {_cp_clip}")
 
         # ── torch.compile ────────────────────────────────────────────────
         if train_cfg.get("torch_compile", False):
@@ -207,14 +224,21 @@ class KazeFlowPretrainer:
             try:
                 self.flow.estimator = torch.compile(
                     self.flow.estimator, mode=compile_mode)
-                self.vocoder.head = torch.compile(
-                    self.vocoder.head, mode=compile_mode)
+                if hasattr(self.vocoder, "get_compilable_module"):
+                    mod = self.vocoder.get_compilable_module()
+                    compiled = torch.compile(mod, mode=compile_mode)
+                    # Replace the attribute on vocoder that points to this module
+                    for name, child in self.vocoder.named_children():
+                        if child is mod:
+                            setattr(self.vocoder, name, compiled)
+                            break
+                else:
+                    self.vocoder = torch.compile(self.vocoder, mode=compile_mode)
                 if compile_disc:
                     self.discriminator = torch.compile(
                         self.discriminator, mode=compile_mode)
-                    logger.info("torch.compile applied (flow + vocoder + discriminator)")
-                else:
-                    logger.info("torch.compile applied (flow + vocoder; discriminator skipped)")
+                disc_label = " + discriminator" if compile_disc else "; discriminator skipped"
+                logger.info(f"torch.compile (mode='{compile_mode}') applied (flow + vocoder{disc_label})")
             except Exception as e:
                 logger.warning(f"torch.compile failed: {e}")
 
@@ -238,6 +262,9 @@ class KazeFlowPretrainer:
         wd = train_cfg.get("weight_decay", 0.01)
         fused = torch.cuda.is_available()
 
+        def _make_adamw(params, lr, betas, **kwargs):
+            return torch.optim.AdamW(params, lr=lr, betas=betas, fused=fused, **kwargs)
+
         # Split flow parameters: exclude biases, norms, and zero-init
         # out_proj from weight decay.  WD on out_proj counteracts the
         # zero-init by pulling weights back toward zero, creating a
@@ -251,17 +278,17 @@ class KazeFlowPretrainer:
                 flow_no_decay.append(p)
             else:
                 flow_decay.append(p)
-        self.optim_flow = torch.optim.AdamW([
+        self.optim_flow = _make_adamw([
             {"params": flow_decay, "weight_decay": wd},
             {"params": flow_no_decay, "weight_decay": 0.0},
-        ], lr=lr_flow, betas=betas_flow, fused=fused)
+        ], lr=lr_flow, betas=betas_flow)
         # Higher β₁ for vocoder/disc smooths the reactive gradient cycle
         # that amplifies gn_voc as the model learns higher-amplitude audio.
         betas_vocoder = tuple(train_cfg.get("betas_vocoder", [0.9, 0.999]))
         betas_disc = tuple(train_cfg.get("betas_disc", [0.9, 0.999]))
-        self.optim_vocoder = torch.optim.AdamW(
+        self.optim_vocoder = _make_adamw(
             self.vocoder.parameters(),
-            lr=lr_voc, betas=betas_vocoder, weight_decay=wd, fused=fused,
+            lr=lr_voc, betas=betas_vocoder, weight_decay=wd,
         )
         # Selective weight decay for discriminator:
         # - Spectral norm: wd=0 everywhere (SN renormalizes, WD is wasted)
@@ -270,9 +297,9 @@ class KazeFlowPretrainer:
         # - Otherwise: wd=wd everywhere
         _disc_cfg = model_cfg.get("discriminator", {})
         if _disc_cfg.get("use_spectral_norm", False):
-            self.optim_disc = torch.optim.AdamW(
+            self.optim_disc = _make_adamw(
                 self.discriminator.parameters(),
-                lr=lr_disc, betas=betas_disc, weight_decay=0.0, fused=fused,
+                lr=lr_disc, betas=betas_disc, weight_decay=0.0,
             )
         else:
             disc_body, disc_conv_post = [], []
@@ -283,19 +310,38 @@ class KazeFlowPretrainer:
                     disc_conv_post.append(p)
                 else:
                     disc_body.append(p)
-            self.optim_disc = torch.optim.AdamW([
+            self.optim_disc = _make_adamw([
                 {"params": disc_body, "weight_decay": wd},
                 {"params": disc_conv_post, "weight_decay": 0.0},
-            ], lr=lr_disc, betas=betas_disc, fused=fused)
+            ], lr=lr_disc, betas=betas_disc)
 
         # ── Schedulers ───────────────────────────────────────────────────
+        _log_section("Training")
         lr_decay = train_cfg.get("lr_decay", 0.9999)
-        self.sched_flow = torch.optim.lr_scheduler.ExponentialLR(
-            self.optim_flow, gamma=lr_decay)
-        self.sched_vocoder = torch.optim.lr_scheduler.ExponentialLR(
-            self.optim_vocoder, gamma=lr_decay)
-        self.sched_disc = torch.optim.lr_scheduler.ExponentialLR(
-            self.optim_disc, gamma=lr_decay)
+        _lr_sched_type = train_cfg.get("lr_scheduler", "exponential")
+        _eta_min_ratio = train_cfg.get("lr_eta_min_ratio", 0.01)
+
+        def _make_sched(optim, t_max):
+            if _lr_sched_type == "cosine":
+                _base_lr = optim.param_groups[0]["lr"]
+                return torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optim, T_max=max(1, t_max),
+                    eta_min=_base_lr * _eta_min_ratio)
+            return torch.optim.lr_scheduler.ExponentialLR(
+                optim, gamma=lr_decay)
+
+        _total_epochs = train_cfg["epochs"]
+        _cfm_wu = train_cfg.get("cfm_warmup_epochs", 50)
+        _voc_wu = train_cfg.get("vocoder_warmup_epochs", 0)
+        self.sched_flow = _make_sched(self.optim_flow, _total_epochs)
+        self.sched_vocoder = _make_sched(
+            self.optim_vocoder, _total_epochs - _cfm_wu)
+        self.sched_disc = _make_sched(
+            self.optim_disc, _total_epochs - _cfm_wu - _voc_wu)
+        logger.info(
+            f"LR scheduler: {_lr_sched_type}"
+            + (f" (eta_min_ratio={_eta_min_ratio})" if _lr_sched_type == "cosine" else f" (gamma={lr_decay})")
+        )
 
         # ── AMP GradScalers (only active with FP16) ────────────────────
         # CRITICAL: Separate scalers for generator path vs discriminator.
@@ -311,6 +357,7 @@ class KazeFlowPretrainer:
             self.writer = SummaryWriter(log_dir=str(self.output_dir / "logs"), max_queue=1)
         self.global_step = 0
         self.epoch = 0
+        self._eval_count = 0  # total evals run; used to bucket audio into groups of 10
 
         # Config shortcuts
         self.sample_rate = model_cfg["sample_rate"]
@@ -333,21 +380,27 @@ class KazeFlowPretrainer:
         _use_san = model_cfg["discriminator"].get("use_san", False)
 
         if _gan_type in ("hinge", "soft_hinge"):
-            self._disc_loss_fn = discriminator_loss_hinge
-            if _use_san or _gan_type == "soft_hinge":
-                # SAN requires monotonically decreasing r(t); standard hinge
-                # gen loss has constant r(t)=1 which is degenerate for SAN.
-                # soft_hinge r(t)=sigmoid(-t) is strictly decreasing ✓
+            if _use_san:
+                # SAN's L2-normalized conv_post caps score magnitude at ~±0.5,
+                # which can never satisfy the hinge margin of 1.0 — the disc
+                # would receive permanent maximum gradient.  Softplus (logistic)
+                # has no hard margin; gradient decays smoothly as confidence
+                # grows, matching SAN's bounded range naturally.
+                self._disc_loss_fn = discriminator_loss_softplus
                 self._gen_loss_fn = generator_loss_soft_hinge
             else:
-                self._gen_loss_fn = generator_loss_hinge
+                self._disc_loss_fn = discriminator_loss_hinge
+                if _gan_type == "soft_hinge":
+                    self._gen_loss_fn = generator_loss_soft_hinge
+                else:
+                    self._gen_loss_fn = generator_loss_hinge
         else:
             self._disc_loss_fn = discriminator_loss_lsgan
             self._gen_loss_fn = generator_loss_lsgan
 
         logger.info(
             f"GAN loss: {_gan_type}"
-            + (f" + SAN (L2-norm conv_post, gen forced to soft_hinge)"
+            + (f" + SAN (softplus disc + soft_hinge gen)"
                if _use_san else "")
         )
         self.grad_clip_flow = train_cfg["grad_clip_flow"]
@@ -369,7 +422,11 @@ class KazeFlowPretrainer:
             self._unwrap_model(self.vocoder), decay=ema_decay,
         )
         self.ema_vocoder.to(self.device)
-        logger.info(f"EMA vocoder initialized (decay={ema_decay})")
+        self.ema_flow = EMAGenerator(
+            self._unwrap_model(self.flow), decay=ema_decay,
+        )
+        self.ema_flow.to(self.device)
+        logger.info(f"EMA vocoder+flow initialized (decay={ema_decay})")
 
 
 
@@ -392,11 +449,11 @@ class KazeFlowPretrainer:
             mel_hat: (1, n_mels, T) generated mel-spectrogram
             wav_hat: (1, 1, T_audio) generated waveform
         """
-        flow = self._unwrap_model(self.flow)
         speaker_embed = self._unwrap_model(self.speaker_embed)
+        ema_flow = self.ema_flow.get_model()
         ema_voc = self.ema_vocoder.get_model()
 
-        flow.eval()
+        ema_flow.eval()
         ema_voc.eval()
         with torch.no_grad():
             g = speaker_embed(spk_id_ref).unsqueeze(-1)
@@ -405,7 +462,7 @@ class KazeFlowPretrainer:
             f0_expanded = f0_ref.unsqueeze(1)
 
             infer_cfg = self.config.get("inference", {})
-            mel_hat = flow.sample(
+            mel_hat = ema_flow.sample(
                 content=spin_ref,
                 f0=f0_expanded,
                 x_mask=x_mask,
@@ -415,7 +472,6 @@ class KazeFlowPretrainer:
             )
 
             wav_hat = ema_voc(mel_hat, f0_ref, g=g)
-        flow.train()
         return mel_hat, wav_hat
 
     def _get_reference_sample(self, dataloader):
@@ -520,10 +576,12 @@ class KazeFlowPretrainer:
             num_workers=train_cfg["num_workers"],
             pin_memory=train_cfg.get("pin_memory", True),
             skip_wav=self.epoch < cfm_warmup,
+            content_embedder=self.config["preprocess"].get("content_embedder", "spin_v2"),
         )
         _dl_has_wav = not (self.epoch < cfm_warmup)
 
         if self.is_main:
+            _log_section("Start")
             logger.info(f"Pretraining for {epochs} epochs ({cfm_warmup} CFM warmup)")
             logger.info(f"Dataset: {len(dataloader.dataset)} samples")
 
@@ -536,7 +594,26 @@ class KazeFlowPretrainer:
 
             self.epoch = epoch
             in_warmup = epoch < cfm_warmup
-            phase = "Warmup" if in_warmup else "Joint"
+            _voc_warmup_epochs = train_cfg.get("vocoder_warmup_epochs", 0)
+            _disc_active = not in_warmup and (epoch >= cfm_warmup + _voc_warmup_epochs)
+            if in_warmup:
+                phase = "Warmup"
+            elif not _disc_active:
+                phase = "VocWarmup"
+            else:
+                phase = "Joint"
+
+            # Ramp GAN coefficient 0→1 over gan_ramp_epochs once disc activates.
+            # Gives Adam time to adapt momentum states from the warmup regime.
+            if _disc_active:
+                _joint_epoch = epoch - (cfm_warmup + _voc_warmup_epochs)
+                _gan_ramp_epochs = train_cfg.get("gan_ramp_epochs", 0)
+                if _gan_ramp_epochs > 0:
+                    _gan_ramp_factor = min(1.0, (_joint_epoch + 1) / _gan_ramp_epochs)
+                else:
+                    _gan_ramp_factor = 1.0
+            else:
+                _gan_ramp_factor = 0.0
 
             # Recreate dataloader at warmup→joint transition to start
             # loading GT waveforms (skip_wav=False) for vocoder training.
@@ -551,6 +628,7 @@ class KazeFlowPretrainer:
                     sample_rate=self.sample_rate,
                     num_workers=train_cfg["num_workers"],
                     pin_memory=train_cfg.get("pin_memory", True),
+                    content_embedder=self.config["preprocess"].get("content_embedder", "spin_v2"),
                 )
                 _dl_has_wav = True
                 if self.is_main:
@@ -570,6 +648,21 @@ class KazeFlowPretrainer:
             )
             _accum_cfm = 0
             _gn_flow = torch.tensor(0.0)
+
+            # Progressive ODE: precompute effective max for this epoch
+            if not in_warmup:
+                import math as _math
+                import random as _random
+                _ode_min_cfg = train_cfg.get("ode_steps_train_min", train_cfg.get("ode_steps_train", 1))
+                _ode_max_cfg = train_cfg.get("ode_steps_train_max", train_cfg.get("ode_steps_train", 1))
+                if train_cfg.get("progressive_ode", False) and _ode_min_cfg < _ode_max_cfg:
+                    _ramp = train_cfg.get("ode_ramp_epochs", epochs - cfm_warmup)
+                    _joint_ep = epoch - cfm_warmup
+                    _progress = min(1.0, max(0.0, _joint_ep / max(1, _ramp)))
+                    _eff_ode_max = max(_ode_min_cfg, int(round(
+                        _ode_min_cfg + (_ode_max_cfg - _ode_min_cfg) * _progress)))
+                else:
+                    _eff_ode_max = _ode_max_cfg
 
             for batch_idx, batch in enumerate(pbar):
                 mel, spin, f0, spk_ids, wav_gt = [x.to(self.device) for x in batch]
@@ -613,6 +706,7 @@ class KazeFlowPretrainer:
                     _gn_flow = torch.nn.utils.clip_grad_norm_(
                         self.flow.parameters(), self.grad_clip_flow)
                     self.scaler_flow.step(self.optim_flow)
+                    self.ema_flow.update()
                     _accum_cfm = 0
 
                 if in_warmup:
@@ -636,20 +730,13 @@ class KazeFlowPretrainer:
                     continue
 
                 # ── Phase 2: Joint training ──────────────────────────
-                # Randomise ODE step count each batch so the vocoder learns
-                # to handle mel of any quality (1-step noisy → many-step clean).
-                # At inference the user can pick any N and quality scales
-                # monotonically — more steps always sounds better.
-                _ode_min = train_cfg.get("ode_steps_train_min", train_cfg.get("ode_steps_train", 1))
-                _ode_max = train_cfg.get("ode_steps_train_max", train_cfg.get("ode_steps_train", 1))
-                if _ode_min == _ode_max:
-                    _ode_n = _ode_min
+                # ODE step count — log-uniform within [ode_min, eff_max]
+                # (eff_max ramps up with progressive_ode, else equals ode_max)
+                if _ode_min_cfg >= _eff_ode_max:
+                    _ode_n = _ode_min_cfg
                 else:
-                    import math as _math
-                    import random as _random
-                    # Log-uniform so small step counts are sampled as often as large ones
                     _ode_n = int(round(_math.exp(
-                        _random.uniform(_math.log(_ode_min), _math.log(_ode_max))
+                        _random.uniform(_math.log(_ode_min_cfg), _math.log(_eff_ode_max))
                     )))
                 self.flow.eval()
                 with torch.no_grad():
@@ -661,13 +748,21 @@ class KazeFlowPretrainer:
                     )
                 self.flow.train()
 
+                # GT mel mixing: with probability gt_mel_ratio, feed the
+                # vocoder the ground-truth mel instead of the CFM prediction.
+                # This gives the vocoder clean targets to learn faithful
+                # waveform reconstruction, breaking the cascaded-error plateau.
+                _gt_mel_ratio = train_cfg.get("gt_mel_ratio", 0.0)
+                _use_gt_mel = _gt_mel_ratio > 0 and _random.random() < _gt_mel_ratio
+                _voc_input_mel = mel.detach() if _use_gt_mel else mel_hat.detach()
+
                 # Vocoder forward — only on generated mel (single forward)
                 # wav_gt from dataset provides the real audio directly,
                 # avoiding a second vocoder forward that would double VRAM.
                 # g.detach(): speaker_embed graph was freed by CFM backward;
                 # vocoder loss should not update speaker_embed (it's in optim_flow).
                 with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                    wav_hat = self.vocoder(mel_hat.detach(), f0, g=g.detach())
+                    wav_hat = self.vocoder(_voc_input_mel, f0, g=g.detach())
 
                     # Align lengths (vocoder iSTFT output may differ slightly)
                     target_len = min(wav_hat.shape[-1], wav_gt.shape[-1])
@@ -675,9 +770,13 @@ class KazeFlowPretrainer:
                     wav_real_det = wav_gt[..., :target_len].detach()
 
                 # Discriminator — repeated n_disc_steps times per gen step
+                # Skipped during vocoder warmup (mel-only training)
                 gn_disc = None
                 d_real = d_fake = 0.0
-                for _disc_i in range(self.n_disc_steps):
+                loss_disc = torch.tensor(0.0, device=self.device)
+                loss_lecam = torch.tensor(0.0, device=self.device)
+                _apply_r1 = False
+                for _disc_i in range(self.n_disc_steps if _disc_active else 0):
                     self.optim_disc.zero_grad()
                     # R1 gradient penalty needs grad w.r.t. real audio
                     _apply_r1 = (self.c_r1 > 0
@@ -723,10 +822,14 @@ class KazeFlowPretrainer:
                 # Generator (vocoder) losses
                 self.optim_vocoder.zero_grad()
                 with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                    y_d_rs, y_d_gs, fmap_rs, fmap_gs = self.discriminator(
-                        wav_real_det, wav_hat, compute_fmaps=True)
-                    loss_gen = self._gen_loss_fn(y_d_gs)
-                    loss_fm = feature_loss(fmap_rs, fmap_gs)
+                    if _disc_active:
+                        y_d_rs, y_d_gs, fmap_rs, fmap_gs = self.discriminator(
+                            wav_real_det, wav_hat, compute_fmaps=True)
+                        loss_gen = self._gen_loss_fn(y_d_gs)
+                        loss_fm = feature_loss(fmap_rs, fmap_gs)
+                    else:
+                        loss_gen = torch.tensor(0.0, device=self.device)
+                        loss_fm = torch.tensor(0.0, device=self.device)
                     loss_mel = mel_spectrogram_loss(
                         wav_real_det, wav_hat,
                         n_fft=self.config["model"]["n_fft"],
@@ -756,7 +859,8 @@ class KazeFlowPretrainer:
                     gn_voc = None
                 else:
                     loss_voc = (
-                        self.c_gen * loss_gen + self.c_fm * loss_fm
+                        _gan_ramp_factor * self.c_gen * loss_gen
+                        + _gan_ramp_factor * self.c_fm * loss_fm
                         + self.c_mel * loss_mel
                         + self.c_mrstft * loss_mrstft
                     )
@@ -821,7 +925,8 @@ class KazeFlowPretrainer:
             self.sched_flow.step()
             if not in_warmup:
                 self.sched_vocoder.step()
-                self.sched_disc.step()
+                if _disc_active:
+                    self.sched_disc.step()
 
             if self.is_main and (epoch + 1) % save_every == 0:
                 self._save_checkpoint(epoch + 1)
@@ -862,9 +967,12 @@ class KazeFlowPretrainer:
                             dataformats="HWC",
                         )
 
-                        # Log generated audio
+                        # Log generated audio — grouped 10 evals per TensorBoard panel
+                        self._eval_count += 1
+                        _audio_group = (self._eval_count - 1) // 10 + 1
+                        _audio_tag = f"eval/audio_g{_audio_group:03d}"
                         self.writer.add_audio(
-                            "eval/audio",
+                            _audio_tag,
                             wav_hat_eval[0, :, :].detach().cpu().float(),
                             self.global_step,
                             sample_rate=self.sample_rate,
@@ -872,51 +980,22 @@ class KazeFlowPretrainer:
 
                         self.writer.flush()
 
-                        # ── Save eval outputs to disk ─────────────────
-                        # TensorBoard reservoir-samples images/audio (max 4 by
-                        # default), so old captures disappear. Saving to disk
-                        # keeps every eval snapshot permanently.
-                        import torchaudio as _ta
-                        eval_dir = self.output_dir / "eval"
-                        eval_dir.mkdir(exist_ok=True)
-                        step_tag = f"ep{epoch+1:04d}_step{self.global_step}"
-                        plt.imsave(
-                            str(eval_dir / f"{step_tag}_mel_original.png"),
-                            mel_orig_np, origin="lower", cmap="viridis",
-                        )
-                        plt.imsave(
-                            str(eval_dir / f"{step_tag}_mel_generated.png"),
-                            mel_gen_np, origin="lower", cmap="viridis",
-                        )
-                        plt.imsave(
-                            str(eval_dir / f"{step_tag}_mel_diff.png"),
-                            np.abs(mel_orig_np - mel_gen_np),
-                            origin="lower", cmap="hot",
-                        )
-                        wav_disk = wav_hat_eval[0].detach().cpu().float()
-                        if wav_disk.dim() == 1:
-                            wav_disk = wav_disk.unsqueeze(0)
-                        _ta.save(
-                            str(eval_dir / f"{step_tag}_audio.wav"),
-                            wav_disk, self.sample_rate,
-                        )
-
                         logger.info(
                             f"Eval inference logged at epoch {epoch+1}, "
-                            f"step {self.global_step} (TensorBoard + {eval_dir})"
+                            f"step {self.global_step}"
                         )
                     except Exception as e:
                         logger.warning(f"Eval inference failed: {e}")
 
         if self.is_main:
             stopped_early = stop_event is not None and stop_event.is_set()
-            self._save_checkpoint(self.epoch if stopped_early else epochs)
             if stopped_early:
                 logger.info(
-                    "Pretraining stopped by user at epoch %d. Checkpoint saved.",
+                    "Pretraining stopped by user at epoch %d. No checkpoint saved.",
                     self.epoch,
                 )
             else:
+                self._save_checkpoint(epochs)
                 logger.info("Pretraining complete.")
         self._cleanup()
 
@@ -948,6 +1027,7 @@ class KazeFlowPretrainer:
             "flow": self._normalize_checkpoint_sd(self._unwrap_model(self.flow).state_dict()),
             "vocoder": self._normalize_checkpoint_sd(self._unwrap_model(self.vocoder).state_dict()),
             "vocoder_ema": self._normalize_checkpoint_sd(self.ema_vocoder.state_dict()),
+            "flow_ema": self._normalize_checkpoint_sd(self.ema_flow.state_dict()),
             "discriminator": self._normalize_checkpoint_sd(self._unwrap_model(self.discriminator).state_dict()),
             "speaker_embed": self._unwrap_model(self.speaker_embed).state_dict(),
             "scaler_flow": self.scaler_flow.state_dict(),
@@ -959,6 +1039,8 @@ class KazeFlowPretrainer:
             "sched_flow": self.sched_flow.state_dict(),
             "sched_vocoder": self.sched_vocoder.state_dict(),
             "sched_disc": self.sched_disc.state_dict(),
+            "lr_scheduler": self.config["train"].get("lr_scheduler", "exponential"),
+            "eval_count": self._eval_count,
             "is_pretrain": True,
         }, tmp_path)
         tmp_path.replace(path)
@@ -1022,6 +1104,11 @@ class KazeFlowPretrainer:
                 self._align_state_dict(self._normalize_checkpoint_sd(ckpt["vocoder_ema"]), self.ema_vocoder))
         else:
             logger.warning("No EMA state in checkpoint — EMA initialized from vocoder weights")
+        if "flow_ema" in ckpt:
+            self.ema_flow.load_state_dict(
+                self._align_state_dict(self._normalize_checkpoint_sd(ckpt["flow_ema"]), self.ema_flow))
+        else:
+            logger.warning("No flow EMA state in checkpoint — EMA initialized from flow weights")
         disc = self._unwrap_model(self.discriminator)
         disc.load_state_dict(
             self._align_state_dict(self._normalize_checkpoint_sd(ckpt["discriminator"]), disc),
@@ -1042,15 +1129,20 @@ class KazeFlowPretrainer:
             )
             saved_state = ckpt["optim_disc"].get("state", {})
             for param_id, s in saved_state.items():
-                # param_id is an int index into the flattened param list
-                # (across all groups). We just copy the moments dict directly.
                 if param_id in self.optim_disc.state:
                     self.optim_disc.state[param_id].update(s)
                 else:
                     self.optim_disc.state[param_id] = s
-        self.sched_flow.load_state_dict(ckpt["sched_flow"])
-        self.sched_vocoder.load_state_dict(ckpt["sched_vocoder"])
-        self.sched_disc.load_state_dict(ckpt["sched_disc"])
+        _sched_type_now = self.config["train"].get("lr_scheduler", "exponential")
+        _sched_type_ckpt = ckpt.get("lr_scheduler", "exponential")
+        if _sched_type_now != _sched_type_ckpt:
+            logger.warning(
+                f"LR scheduler type changed ({_sched_type_ckpt} → {_sched_type_now}) — "
+                "scheduler state not loaded, starting fresh.")
+        else:
+            self.sched_flow.load_state_dict(ckpt["sched_flow"])
+            self.sched_vocoder.load_state_dict(ckpt["sched_vocoder"])
+            self.sched_disc.load_state_dict(ckpt["sched_disc"])
         # Override LRs from config — load_state_dict restores the checkpoint's
         # param_groups (including the old LR), so any config changes only take
         # effect if we explicitly re-apply them here. We rescale the scheduler's
@@ -1119,6 +1211,31 @@ class KazeFlowPretrainer:
             logger.info("Migrated single scaler → separate gen/disc scalers")
         self.epoch = ckpt["epoch"]
         self.global_step = ckpt["global_step"]
+        self._eval_count = ckpt.get("eval_count", 0)
+        # If transitioning exponential → cosine, the scheduler state was skipped
+        # and CosineAnnealingLR was initialized from epoch 0 (T_max = full run).
+        # Rebuild it with last_epoch = self.epoch - 1 so the first .step() after
+        # the resumed epoch lands at the correct cosine position.
+        if _sched_type_now != _sched_type_ckpt and _sched_type_now == "cosine":
+            _tc = self.config["train"]
+            _T = _tc["epochs"]
+            _cw = _tc.get("cfm_warmup_epochs", 50)
+            _vw = _tc.get("vocoder_warmup_epochs", 0)
+            _er = _tc.get("lr_eta_min_ratio", 0.01)
+            def _cosine_at(optim, t_max, at_ep):
+                _base = optim.param_groups[0]["lr"]
+                return torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optim, T_max=max(1, t_max),
+                    eta_min=_base * _er,
+                    last_epoch=max(0, at_ep - 1),
+                )
+            self.sched_flow    = _cosine_at(self.optim_flow,    _T,           self.epoch)
+            self.sched_vocoder = _cosine_at(self.optim_vocoder, _T - _cw,     max(0, self.epoch - _cw))
+            self.sched_disc    = _cosine_at(self.optim_disc,    _T - _cw - _vw, max(0, self.epoch - _cw - _vw))
+            logger.info(
+                f"Cosine schedulers rebuilt at epoch {self.epoch} "
+                f"(T_max flow={_T}, voc={_T-_cw}, disc={_T-_cw-_vw})"
+            )
         logger.info(f"Resumed from {path} (epoch {self.epoch})")
 
 

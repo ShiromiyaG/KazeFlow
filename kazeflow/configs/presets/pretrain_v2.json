@@ -1,0 +1,11 @@
+{
+  "train": {
+    "gt_mel_ratio": 0.0,
+    "afm": {
+      "c_afm": 0.1,
+      "adv_every": 2,
+      "ramp_epochs": 50,
+      "curriculum_epochs": 100
+    }
+  }
+}

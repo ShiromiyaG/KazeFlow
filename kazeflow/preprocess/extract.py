@@ -46,28 +46,14 @@ def _load_audio_16k(file_path: str) -> np.ndarray:
 
 # ── Embedding loader ───────────────────────────────────────────────────────────
 
-def _load_embedding(device: str) -> torch.nn.Module:
+def _load_embedding(device: str, embedder_name: str = "spin_v2") -> torch.nn.Module:
     """
-    Load the SPIN v2 HuBERT model.
+    Load a content embedder (SPIN v2 or RSPIN).
 
-    Prefers the local downloaded copy in kazeflow/models/pretrained/embedders/spin_v2/.
-    Falls back to the HF Hub identifier 'dr87/spinv2_rvc' if local is missing.
+    Returns a model with forward(wav) → (B, T_frames, output_dim).
     """
-    from transformers import HubertModel
-
-    if _SPIN_V2_DIR.exists():
-        source = str(_SPIN_V2_DIR)
-    else:
-        source = "dr87/spinv2_rvc"
-        logger.warning(
-            "Local SPIN v2 weights not found at %s. "
-            "Falling back to HF Hub '%s'. "
-            "Run app.py to trigger the automatic prerequisites download.",
-            _SPIN_V2_DIR, source,
-        )
-
-    model = HubertModel.from_pretrained(source)
-    return model.to(device).float().eval()
+    from kazeflow.models.embedder import load_content_embedder
+    return load_content_embedder(name=embedder_name, device=device)
 
 
 # ── F0 extraction ──────────────────────────────────────────────────────────────
@@ -198,21 +184,31 @@ def _process_file_embedding_worker(
     device_num: int,
     device: str,
     n_threads: int,
+    embedder_name: str = "spin_v2",
 ) -> None:
-    """Worker: extract SPIN v2 embeddings for a shard of files."""
-    model = _load_embedding(device)
+    """Worker: extract content embeddings for a shard of files."""
+    model = _load_embedding(device, embedder_name)
+    expected_dim = model.output_dim
     n_threads = max(1, n_threads)
 
     def _worker(file_info):
         wav_path, _, _, out_path = file_info
         if os.path.exists(out_path):
-            return
+            # Check dimension matches current embedder; re-extract on mismatch
+            try:
+                old = np.load(out_path)
+                if old.shape[-1] == expected_dim:
+                    return
+                logger.info("Dim mismatch %s: got %d, need %d — re-extracting",
+                            out_path, old.shape[-1], expected_dim)
+            except Exception:
+                pass  # corrupted file — re-extract
         try:
             audio_np = _load_audio_16k(wav_path)
             feats = torch.from_numpy(audio_np).to(device).float().view(1, -1)
             with torch.no_grad():
-                result = model(feats)["last_hidden_state"]
-            feats_out = result.squeeze(0).float().cpu().numpy()  # (T, 768)
+                result = model(feats)  # (1, T, embed_dim)
+            feats_out = result.squeeze(0).float().cpu().numpy()  # (T, embed_dim)
             if not np.isnan(feats_out).any():
                 np.save(out_path, feats_out, allow_pickle=False)
             else:
@@ -234,19 +230,21 @@ def run_embedding_extraction(
     files: list,
     devices: list[str],
     threads: int,
+    embedder_name: str = "spin_v2",
 ) -> None:
     """
-    Extract SPIN v2 embeddings for all files, sharding across devices.
+    Extract content embeddings for all files, sharding across devices.
 
     Args:
-        files:   List of [wav_path, f0_coarse_out, f0_full_out, embed_out].
-        devices: List of device strings.
-        threads: Total thread budget (split evenly across devices).
+        files:          List of [wav_path, f0_coarse_out, f0_full_out, embed_out].
+        devices:        List of device strings.
+        threads:        Total thread budget (split evenly across devices).
+        embedder_name:  "spin_v2" or "rspin".
     """
     devices_str = ", ".join(devices)
     logger.info(
-        "Starting embedding extraction with %d threads on %s (SPIN v2)...",
-        threads, devices_str,
+        "Starting embedding extraction with %d threads on %s (%s)...",
+        threads, devices_str, embedder_name,
     )
     start = time.time()
     n = len(devices)
@@ -258,6 +256,7 @@ def run_embedding_extraction(
                 i,
                 devices[i],
                 max(1, threads // n),
+                embedder_name,
             )
             for i in range(n)
         ]

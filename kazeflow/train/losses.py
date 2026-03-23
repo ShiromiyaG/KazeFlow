@@ -183,6 +183,35 @@ def generator_loss_soft_hinge(disc_outputs: List[torch.Tensor]) -> torch.Tensor:
     return loss / max(len(disc_outputs), 1)
 
 
+@torch.amp.autocast("cuda", enabled=False)
+def discriminator_loss_softplus(
+    disc_real_outputs: List[torch.Tensor],
+    disc_generated_outputs: List[torch.Tensor],
+) -> Tuple[torch.Tensor, float, float]:
+    """Softplus (logistic) discriminator loss — margin-free, scale-invariant.
+
+    D_loss = E[softplus(-D(x))] + E[softplus(D(G(z)))]
+
+    Unlike hinge (margin=1.0), softplus has no hard threshold — gradient
+    decays smoothly as the discriminator becomes more confident.  This
+    makes it compatible with SAN's L2-normalized conv_post, which caps
+    output magnitude at ~±0.5 and can never reach the hinge margin.
+
+    StyleGAN2 uses this for both D and G.
+    """
+    loss = torch.tensor(0.0, device=disc_real_outputs[0].device)
+    d_real_sum, d_fake_sum = 0.0, 0.0
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        dr_f = dr.float()
+        dg_f = dg.float()
+        loss = loss + torch.mean(F.softplus(-dr_f)) + torch.mean(F.softplus(dg_f))
+        d_real_sum += dr.detach().mean().item()
+        d_fake_sum += dg.detach().mean().item()
+
+    n = max(len(disc_real_outputs), 1)
+    return loss / n, d_real_sum / n, d_fake_sum / n
+
+
 class LeCamEMA:
     """LeCam regularization for discriminator (Tseng et al., 2021).
 

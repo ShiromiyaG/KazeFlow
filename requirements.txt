@@ -10,3 +10,5 @@ tqdm
 faiss-cpu
 torchcodec
 matplotlib
+triton==3.6.0; sys_platform == "linux"
+triton-windows==3.6.0.post26; sys_platform == "win32"

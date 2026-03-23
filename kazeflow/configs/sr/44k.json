@@ -1,0 +1,11 @@
+{
+  "model": {
+    "sample_rate": 44100,
+    "hop_length": 441,
+    "segment_size": 21168,
+    "vocoder": {
+      "upsample_rates": [7, 7, 3, 3],
+      "upsample_kernel_sizes": [14, 14, 6, 6]
+    }
+  }
+}

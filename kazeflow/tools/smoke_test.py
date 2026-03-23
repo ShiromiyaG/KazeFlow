@@ -13,7 +13,7 @@ How it works:
 
 Usage:
     python -m kazeflow.tools.smoke_test
-    python -m kazeflow.tools.smoke_test --config kazeflow/configs/pretrain.json --steps 400
+    python -m kazeflow.tools.smoke_test --config logs/pretrain/config.json --steps 400
     python -m kazeflow.tools.smoke_test --device cpu --steps 100
 
 Pass criteria (all must pass for a clean config):
@@ -43,8 +43,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from kazeflow.models.flow_matching import ConditionalFlowMatching
-from kazeflow.models.vocoder import ChouwaGANGenerator, EMAGenerator
-from kazeflow.models.discriminator import ChouwaGANDiscriminator
+from kazeflow.models.vocoder import build_vocoder, EMAGenerator
+from kazeflow.models.discriminator import build_discriminator
 from kazeflow.train.losses import (
     discriminator_loss_hinge,
     discriminator_loss_lsgan,
@@ -71,7 +71,8 @@ def _fail(msg): return f"{RED}FAIL{RESET}  {msg}"
 def _warn(msg): return f"{YELLOW}WARN{RESET}  {msg}"
 
 
-def _make_batch(B, n_mels, segment_frames, hop_length, sample_rate, n_speakers, device):
+def _make_batch(B, n_mels, segment_frames, hop_length, sample_rate, n_speakers, device,
+                cond_channels=768):
     """Return one structured synthetic batch that mimics real data statistics.
 
     Instead of pure random noise, generates:
@@ -122,7 +123,7 @@ def _make_batch(B, n_mels, segment_frames, hop_length, sample_rate, n_speakers, 
     mel = torch.log(torch.clamp(torch.matmul(mel_basis, spec.abs()), min=1e-5))
     mel = mel[..., :segment_frames]  # exact frame count
 
-    spin   = torch.randn(B, 768, segment_frames, device=device) * 0.5
+    spin   = torch.randn(B, cond_channels, segment_frames, device=device) * 0.5
     spk_ids = torch.randint(0, n_speakers, (B,), device=device)
     return mel, spin, f0, spk_ids, wav_gt
 
@@ -137,7 +138,9 @@ def _avg(q):
 
 def main():
     parser = argparse.ArgumentParser(description="KazeFlow smoke test")
-    parser.add_argument("--config", default="kazeflow/configs/pretrain.json")
+    parser.add_argument("--config", default=None,
+                        help="Path to a full config JSON (e.g. logs/pretrain/config.json). "
+                             "If omitted, uses load_config(48000, preset='pretrain').")
     parser.add_argument("--steps", type=int, default=500,
                         help="Total steps (warmup + joint)")
     parser.add_argument("--warmup-frac", type=float, default=0.4,
@@ -149,11 +152,15 @@ def main():
     parser.add_argument("--no-tb", action="store_true", help="Disable TensorBoard")
     args = parser.parse_args()
 
-    config_path = Path(args.config)
-    if not config_path.is_absolute():
-        config_path = _ROOT / config_path
-    with open(config_path) as f:
-        cfg = json.load(f)
+    if args.config is not None:
+        config_path = Path(args.config)
+        if not config_path.is_absolute():
+            config_path = _ROOT / config_path
+        with open(config_path) as f:
+            cfg = json.load(f)
+    else:
+        from kazeflow.configs import load_config
+        cfg = load_config(48000, preset="pretrain")
 
     model_cfg = cfg["model"]
     train_cfg  = cfg["train"]
@@ -196,19 +203,17 @@ def main():
     # ── Build models ──────────────────────────────────────────────────────────
     print(f"\nBuilding models on {device}...")
     flow = ConditionalFlowMatching(**model_cfg["flow_matching"]).to(device)
-    vocoder = ChouwaGANGenerator(sr=sample_rate, **model_cfg["vocoder"]).to(device)
-    discriminator = ChouwaGANDiscriminator(sample_rate=sample_rate, **model_cfg["discriminator"]).to(device)
+    vocoder_type = model_cfg.get("vocoder_type", "chouwa_gan")
+    vocoder = build_vocoder(vocoder_type, sr=sample_rate, **model_cfg["vocoder"]).to(device)
+    disc_type = model_cfg.get("discriminator_type", vocoder_type)
+    discriminator = build_discriminator(disc_type, sample_rate=sample_rate, **model_cfg["discriminator"]).to(device)
     speaker_embed = nn.Embedding(n_speakers, model_cfg.get("speaker_embed_dim", 256)).to(device)
     ema_vocoder = EMAGenerator(vocoder)
 
-    # ── Per-layer gradient clip on conv_post (matches real pretrain) ────────
+    # ── Per-layer gradient clip on vocoder output layer ────────────────────
     _cp_clip = train_cfg.get("conv_post_grad_clip", 0.0)
-    if _cp_clip > 0:
-        def _clip_hook(grad, _max=_cp_clip):
-            gn = grad.norm()
-            return grad * (_max / gn) if gn > _max else grad
-        for p in vocoder.head.conv_post.parameters():
-            p.register_hook(_clip_hook)
+    if _cp_clip > 0 and hasattr(vocoder, "register_output_grad_clip"):
+        vocoder.register_output_grad_clip(_cp_clip)
 
     n_flow  = sum(p.numel() for p in flow.parameters()) / 1e6
     n_voc   = sum(p.numel() for p in vocoder.parameters()) / 1e6
@@ -264,7 +269,9 @@ def main():
 
     # ── Synthetic batch (fixed — same every step for overfit) ─────────────────
     print(f"\nGenerating synthetic batch (B={B}, T={segment_frames}, audio_len={segment_frames*hop_length})...")
-    batch = _make_batch(B, n_mels, segment_frames, hop_length, sample_rate, n_speakers, device)
+    cond_channels = model_cfg["flow_matching"]["cond_channels"]
+    batch = _make_batch(B, n_mels, segment_frames, hop_length, sample_rate, n_speakers, device,
+                        cond_channels=cond_channels)
 
     # ── Trackers ──────────────────────────────────────────────────────────────
     cfm_early   = deque(maxlen=20)
