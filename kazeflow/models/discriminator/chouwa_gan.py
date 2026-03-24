@@ -6,8 +6,6 @@ Combined MS-STFT + FastMPD + UnivHD discriminator.
 - FastMPD (4 periods): periodic waveform patterns
 - UnivHD (1): harmonic tracking
 Total: 8 sub-discriminators, ~2.7M params.
-
-Ported from Codename-fork-4 with all dependencies inlined.
 """
 
 import math

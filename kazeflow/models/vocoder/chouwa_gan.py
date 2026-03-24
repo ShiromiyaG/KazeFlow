@@ -7,8 +7,6 @@ Self-contained HiFiGAN-PCPH vocoder with:
 - LearnableHarmonicSource with anti-aliased harmonics
 - Linear harmonic merge (no Tanh — prevents intermodulation/KL collapse)
 - EMA (Exponential Moving Average) generator for improved inference quality
-
-Ported from Codename-fork-4's ChouwaGAN with all dependencies inlined.
 """
 
 import copy

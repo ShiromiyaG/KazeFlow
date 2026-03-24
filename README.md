@@ -134,6 +134,23 @@ env/bin/tensorboard --logdir logs/
 
 Opens at `http://127.0.0.1:25565`.
 
+## Referenced Projects
+
+KazeFlow builds on ideas and code from the following projects:
+
+| Project | Description |
+|---|---|
+| [Conditional Flow Matching](https://arxiv.org/abs/2210.02747) | ODE-based generative modeling (Lipman et al., 2023) — core mel generation method |
+| [HiFi-GAN](https://github.com/jik876/hifi-gan) | High-fidelity waveform synthesis — backbone of the ChouwaGAN vocoder |
+| [BigVGAN](https://github.com/NVIDIA/BigVGAN) | Large-scale vocoder with SnakeBeta activations and anti-aliased upsampling |
+| [SPIN](https://github.com/vectominist/spin) / [R-Spin](https://github.com/vectominist/rspin) | Speaker and noise-invariant speech representations (Chang et al., NAACL 2024) |
+| [Codename RVC Fork 4](https://github.com/codename0og/codename-rvc-fork-4) | SmartCutter, and preprocessing pipeline |
+| [RVC (Retrieval-based Voice Conversion)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) | FAISS indexing pipeline for speaker similarity retrieval |
+| [WavLM](https://github.com/microsoft/unilm/tree/master/wavlm) | Self-supervised speech representation (Microsoft) — R-Spin backbone |
+| [RMVPE](https://github.com/Dream-High/RMVPE) | Robust pitch (F0) extraction model |
+| [FAISS](https://github.com/facebookresearch/faiss) | Efficient similarity search for speaker feature indexing |
+| [Triton](https://github.com/triton-lang/triton) | GPU kernel compiler — fused SnakeBeta activation |
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

@@ -9,7 +9,11 @@ from pathlib import Path
 
 import gradio as gr
 
+from tabs import _gpu_caps, get_precision_choices
+
 logger = logging.getLogger("kazeflow.ui.train")
+
+_GPU_CAPS = _gpu_caps()
 
 _training_thread = None
 _training_status = "Idle"
@@ -568,16 +572,17 @@ def create_training_tab():
                     )
 
             # ── Advanced Settings ────────────────────────────────────
+            _prec_choices, _prec_default = get_precision_choices(_GPU_CAPS)
             with gr.Accordion("⚙ Advanced Settings", open=False):
                 with gr.Group():
                     gr.Markdown("#### Precision & Compilation")
                     precision = gr.Radio(
                         label="Precision",
-                        choices=["fp32", "fp32_fp16", "tf32", "tf32_fp16", "tf32_bf16"],
-                        value="tf32_bf16",
+                        choices=_prec_choices,
+                        value=_prec_default,
                         info="tf32_bf16: recommended for Ampere+ GPUs.",
                     )
-                    with gr.Row():
+                    with gr.Row(visible=_GPU_CAPS["has_compile"]):
                         torch_compile = gr.Checkbox(
                             label="torch.compile", value=False,
                             info="~10–30% speedup (PyTorch 2.0+).",
