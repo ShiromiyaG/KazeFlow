@@ -2,7 +2,7 @@
   <img src="assets/images/logo.png" alt="KazeFlow" width="480">
 </p>
 
-# KazeFlow
+<h1 align="center">KazeFlow<strong>, Completely experimental, no pretrain available, and probably unfinished.</strong></h1>
 
 KazeFlow is a voice conversion system with a web interface. Feed it audio from any speaker and it converts it to the timbre of a trained model, preserving the original content and intonation.
 
@@ -38,7 +38,7 @@ The installer automatically downloads Python, PyTorch with CUDA, and all depende
 start.bat
 ```
 
-Opens the interface at `http://localhost:7860`.
+Opens the interface at `http://127.0.0.1:7860`.
 
 ---
 
@@ -132,8 +132,8 @@ TensorBoard logs are saved to `logs/<model_name>/`. To view them:
 env/bin/tensorboard --logdir logs/
 ```
 
-Opens at `http://localhost:6006`.
+Opens at `http://127.0.0.1:25565`.
 
 ## License
 
-See LICENSE file for details.
+This project is licensed under the [MIT License](LICENSE).

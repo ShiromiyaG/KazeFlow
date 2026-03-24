@@ -6,6 +6,7 @@ for content-to-mel generation and ChouwaGAN for mel-to-waveform synthesis.
 """
 
 import os
+import sys
 import logging
 import gradio as gr
 
@@ -231,10 +232,12 @@ def create_app():
 
 
 if __name__ == "__main__":
+    _share = "--share" in sys.argv
     app = create_app()
     app.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=7860,
-        share=False,
+        share=_share,
+        inbrowser=True,
         favicon_path=_LOGO_PATH,
     )

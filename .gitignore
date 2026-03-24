@@ -29,6 +29,8 @@ env/
 # Entire logs/ tree: extracted features, sliced audio, checkpoints, TensorBoard
 logs/**
 !logs/.gitkeep
+!logs/run_tensorboard_in_model_folder.sh
+!logs/run_tensorboard_in_model_folder.bat
 
 # ── User assets ──────────────────────────────────────────────────────────────
 assets/audios/**
