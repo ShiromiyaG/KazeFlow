@@ -125,6 +125,9 @@
     "lr_decay": 0.999,
     "lr_scheduler": "cosine",
     "lr_eta_min_ratio": 0.01,
+    "lr_warmup_epochs": 0,
+    "disc_restart_period": 50,
+    "disc_restart_mult": 2,
     "weight_decay": 0.01,
     "epochs": 1000,
     "save_every": 50,
@@ -149,7 +152,6 @@
     "use_gradient_balancer": false,
     "balancer_ema_decay": 0.999,
     "ode_method_train": "midpoint",
-    "vocoder_warmup_epochs": 0,
     "f0_method": "rmvpe",
     "num_workers": 4,
     "pin_memory": true,
@@ -162,7 +164,6 @@
     "progressive_ode": true,
     "ode_ramp_epochs": 200,
     "gt_mel_ratio": 0.0,
-    "gan_ramp_epochs": 10,
     "n_disc_steps": 1
   },
   "inference": {

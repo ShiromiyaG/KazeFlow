@@ -38,6 +38,7 @@ from kazeflow.models.vocoder import build_vocoder, EMAGenerator
 from kazeflow.models.discriminator import build_discriminator
 from kazeflow.train.dataset import create_dataloader
 from kazeflow.train.losses import (
+    GradientBalancer,
     LeCamEMA,
     discriminator_loss_lsgan,
     discriminator_loss_hinge,
@@ -119,16 +120,7 @@ class KazeFlowTrainer:
         self.use_amp = False
         self.amp_dtype = torch.float32
 
-        if precision == "bf16":
-            # BF16: same dynamic range as FP32, no GradScaler needed.
-            # Preferred over FP16 for training stability (no overflow at 65504).
-            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                self.use_amp = True
-                self.amp_dtype = torch.bfloat16
-                logger.info("BF16 mixed precision enabled (recommended)")
-            else:
-                logger.warning("BF16 requested but not supported. Falling back to FP32.")
-        elif precision == "tf32_fp16":
+        if precision == "tf32_fp16":
             # Combined: TF32 matmuls + FP16 AMP for maximum throughput
             if _check_tf32_support():
                 torch.backends.cuda.matmul.allow_tf32 = True
@@ -164,11 +156,11 @@ class KazeFlowTrainer:
                 logger.info("TF32 enabled (Ampere+ GPU detected)")
             else:
                 logger.warning("TF32 requested but GPU doesn't support it (need sm_80+). Using FP32.")
-        elif precision == "fp16":
+        elif precision == "fp32_fp16":
             if _check_fp16_support():
                 self.use_amp = True
                 self.amp_dtype = torch.float16
-                logger.info("FP16 mixed precision (AMP) enabled")
+                logger.info("FP32 + FP16 AMP enabled")
             else:
                 logger.warning("FP16 requested but GPU doesn't support it efficiently. Using FP32.")
         elif precision == "fp32":
@@ -311,10 +303,33 @@ class KazeFlowTrainer:
         lr_decay = train_cfg.get("lr_decay", 0.999)
         _lr_sched_type = train_cfg.get("lr_scheduler", "exponential")
         _eta_min_ratio = train_cfg.get("lr_eta_min_ratio", 0.01)
+        _lr_warmup_epochs = train_cfg.get("lr_warmup_epochs", 0)
+        _disc_restart_period = train_cfg.get("disc_restart_period", 50)
+        _disc_restart_mult = train_cfg.get("disc_restart_mult", 2)
 
-        def _make_sched(optim, t_max):
+        def _make_sched(optim, t_max, is_disc=False):
             if _lr_sched_type == "cosine":
                 _base_lr = optim.param_groups[0]["lr"]
+                return torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optim, T_max=max(1, t_max),
+                    eta_min=_base_lr * _eta_min_ratio)
+            if _lr_sched_type == "cosine_warmup_restarts":
+                _base_lr = optim.param_groups[0]["lr"]
+                if is_disc:
+                    return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                        optim, T_0=max(1, _disc_restart_period),
+                        T_mult=_disc_restart_mult,
+                        eta_min=_base_lr * _eta_min_ratio)
+                if _lr_warmup_epochs > 0 and t_max > _lr_warmup_epochs:
+                    _wu = torch.optim.lr_scheduler.LinearLR(
+                        optim, start_factor=0.01, end_factor=1.0,
+                        total_iters=_lr_warmup_epochs)
+                    _cos = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optim, T_max=max(1, t_max - _lr_warmup_epochs),
+                        eta_min=_base_lr * _eta_min_ratio)
+                    return torch.optim.lr_scheduler.SequentialLR(
+                        optim, schedulers=[_wu, _cos],
+                        milestones=[_lr_warmup_epochs])
                 return torch.optim.lr_scheduler.CosineAnnealingLR(
                     optim, T_max=max(1, t_max),
                     eta_min=_base_lr * _eta_min_ratio)
@@ -322,16 +337,18 @@ class KazeFlowTrainer:
                 optim, gamma=lr_decay)
 
         _total_epochs = train_cfg["epochs"]
-        _voc_wu = train_cfg.get("vocoder_warmup_epochs", 0)
         self.sched_flow = _make_sched(self.optim_flow, _total_epochs)
-        self.sched_vocoder = _make_sched(
-            self.optim_vocoder, _total_epochs)
-        self.sched_disc = _make_sched(
-            self.optim_disc, _total_epochs - _voc_wu)
-        logger.info(
-            f"LR scheduler: {_lr_sched_type}"
-            + (f" (eta_min_ratio={_eta_min_ratio})" if _lr_sched_type == "cosine" else f" (gamma={lr_decay})")
-        )
+        self.sched_vocoder = _make_sched(self.optim_vocoder, _total_epochs)
+        self.sched_disc = _make_sched(self.optim_disc, _total_epochs, is_disc=True)
+        if _lr_sched_type == "cosine":
+            _sched_info = f" (eta_min_ratio={_eta_min_ratio})"
+        elif _lr_sched_type == "cosine_warmup_restarts":
+            _sched_info = (f" (warmup={_lr_warmup_epochs}ep, "
+                           f"disc_restart={_disc_restart_period}x{_disc_restart_mult}, "
+                           f"eta_min_ratio={_eta_min_ratio})")
+        else:
+            _sched_info = f" (gamma={lr_decay})"
+        logger.info(f"LR scheduler: {_lr_sched_type}{_sched_info}")
 
         # ── AMP GradScalers (only active with FP16) ────────────────────
         # CRITICAL: Separate scalers for generator path vs discriminator.
@@ -394,6 +411,26 @@ class KazeFlowTrainer:
         self.c_lecam = train_cfg.get("c_lecam", 0.0)
         self.lecam = LeCamEMA(decay=train_cfg.get("lecam_ema_decay", 0.999)) if self.c_lecam > 0 else None
         self.cfm_grad_accum = max(1, int(train_cfg.get("cfm_grad_accum", 1)))
+
+        # ── Gradient Balancer (EnCodec-style) ────────────────────────
+        self.use_gradient_balancer = train_cfg.get("use_gradient_balancer", False)
+        if self.use_gradient_balancer:
+            _bal_weights = {
+                "gen": self.c_gen,
+                "fm": self.c_fm,
+                "mel": self.c_mel,
+                "mrstft": self.c_mrstft,
+            }
+            self.gradient_balancer = GradientBalancer(
+                weights=_bal_weights,
+                ema_decay=train_cfg.get("balancer_ema_decay", 0.999),
+            )
+            logger.info(
+                f"Gradient balancer enabled "
+                f"(weights={_bal_weights}, ema_decay={train_cfg.get('balancer_ema_decay', 0.999)})"
+            )
+        else:
+            self.gradient_balancer = None
 
         # Mel basis cache
         self._mel_basis = None
@@ -500,6 +537,7 @@ class KazeFlowTrainer:
         log_every = train_cfg["log_every"]
 
         _log_section("Start")
+        logger.info(f"Vocoder: {model_cfg.get('vocoder_type', 'chouwa_gan')}")
         logger.info(f"Starting training for {epochs} epochs")
         logger.info(f"Dataset: {len(dataloader.dataset)} samples")
         logger.info(f"Batch size: {train_cfg['batch_size']}")
@@ -512,26 +550,13 @@ class KazeFlowTrainer:
                 break
 
             self.epoch = epoch
-            _voc_warmup_epochs = train_cfg.get("vocoder_warmup_epochs", 0)
-            _disc_active = epoch >= _voc_warmup_epochs
-            if _disc_active:
-                _phase = "Joint"
-                _joint_epoch = epoch - _voc_warmup_epochs
-                _gan_ramp_epochs = train_cfg.get("gan_ramp_epochs", 0)
-                if _gan_ramp_epochs > 0:
-                    _gan_ramp_factor = min(1.0, (_joint_epoch + 1) / _gan_ramp_epochs)
-                else:
-                    _gan_ramp_factor = 1.0
-            else:
-                _phase = "VocWarmup"
-                _gan_ramp_factor = 0.0
             self.flow.train()
             self.vocoder.train()
             self.discriminator.train()
 
             pbar = tqdm(
                 dataloader,
-                desc=f"[{_phase}] Epoch {epoch+1}/{epochs}",
+                desc=f"Epoch {epoch+1}/{epochs}",
                 unit="batch",
                 leave=True,
                 dynamic_ncols=True,
@@ -638,13 +663,12 @@ class KazeFlowTrainer:
                     wav_real_detached = wav_gt[..., :target_len].detach()
 
                 # ── Step 4: Discriminator — repeated n_disc_steps times per gen step
-                # Skipped during vocoder warmup (mel-only training)
                 gn_disc = None
                 d_real_mean = d_fake_mean = 0.0
                 loss_disc = torch.tensor(0.0, device=self.device)
                 loss_lecam = torch.tensor(0.0, device=self.device)
                 _apply_r1 = False
-                for _disc_i in range(self.n_disc_steps if _disc_active else 0):
+                for _disc_i in range(self.n_disc_steps):
                     self.optim_disc.zero_grad()
                     # R1 gradient penalty needs grad w.r.t. real audio
                     _apply_r1 = (self.c_r1 > 0
@@ -694,15 +718,11 @@ class KazeFlowTrainer:
                 self.optim_vocoder.zero_grad()
 
                 with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                    if _disc_active:
-                        y_d_rs, y_d_gs, fmap_rs, fmap_gs = self.discriminator(
-                            wav_real_detached, wav_hat, compute_fmaps=True,
-                        )
-                        loss_gen = self._gen_loss_fn(y_d_gs)
-                        loss_fm = feature_loss(fmap_rs, fmap_gs)
-                    else:
-                        loss_gen = torch.tensor(0.0, device=self.device)
-                        loss_fm = torch.tensor(0.0, device=self.device)
+                    y_d_rs, y_d_gs, fmap_rs, fmap_gs = self.discriminator(
+                        wav_real_detached, wav_hat, compute_fmaps=True,
+                    )
+                    loss_gen = self._gen_loss_fn(y_d_gs)
+                    loss_fm = feature_loss(fmap_rs, fmap_gs)
                     loss_mel = mel_spectrogram_loss(
                         wav_real_detached, wav_hat,
                         n_fft=self.config["model"]["n_fft"],
@@ -731,17 +751,37 @@ class KazeFlowTrainer:
                     self.optim_vocoder.zero_grad(set_to_none=True)
                     gn_voc = None
                 else:
-                    loss_voc_total = (
-                        _gan_ramp_factor * self.c_gen * loss_gen
-                        + _gan_ramp_factor * self.c_fm * loss_fm
-                        + self.c_mel * loss_mel
-                        + self.c_mrstft * loss_mrstft
-                    )
-                    self.scaler_gen.scale(loss_voc_total).backward()
-                    self.scaler_gen.unscale_(self.optim_vocoder)
-                    gn_voc = torch.nn.utils.clip_grad_norm_(
-                        self.vocoder.parameters(), self.grad_clip_voc)
-                    self.scaler_gen.step(self.optim_vocoder)
+                    if self.gradient_balancer is not None:
+                        _voc_losses = {
+                            "gen": loss_gen,
+                            "fm": loss_fm,
+                            "mel": loss_mel,
+                            "mrstft": loss_mrstft,
+                        }
+                        # Pick a reference param for gradient norm measurement
+                        _ref_param = next(self.vocoder.parameters())
+                        loss_voc_total = self.gradient_balancer.backward(
+                            _voc_losses, _ref_param,
+                            scaler=self.scaler_gen if self._needs_scaler else None,
+                        )
+                        if not self._needs_scaler:
+                            pass  # backward already called by balancer
+                        self.scaler_gen.unscale_(self.optim_vocoder)
+                        gn_voc = torch.nn.utils.clip_grad_norm_(
+                            self.vocoder.parameters(), self.grad_clip_voc)
+                        self.scaler_gen.step(self.optim_vocoder)
+                    else:
+                        loss_voc_total = (
+                            self.c_gen * loss_gen
+                            + self.c_fm * loss_fm
+                            + self.c_mel * loss_mel
+                            + self.c_mrstft * loss_mrstft
+                        )
+                        self.scaler_gen.scale(loss_voc_total).backward()
+                        self.scaler_gen.unscale_(self.optim_vocoder)
+                        gn_voc = torch.nn.utils.clip_grad_norm_(
+                            self.vocoder.parameters(), self.grad_clip_voc)
+                        self.scaler_gen.step(self.optim_vocoder)
                     self.ema_vocoder.update()
 
                 if _do_flow_step:
@@ -789,6 +829,10 @@ class KazeFlowTrainer:
                     # LeCam regularization
                     if self.lecam is not None:
                         self.writer.add_scalar("loss/lecam", loss_lecam.item(), step)
+                    # Gradient balancer EMA norms
+                    if self.gradient_balancer is not None and self.gradient_balancer._initialized:
+                        for name, ema_norm in self.gradient_balancer._ema_norms.items():
+                            self.writer.add_scalar(f"balancer/ema_norm_{name}", ema_norm, step)
 
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -800,8 +844,7 @@ class KazeFlowTrainer:
 
             self.sched_flow.step()
             self.sched_vocoder.step()
-            if _disc_active:
-                self.sched_disc.step()
+            self.sched_disc.step()
 
             if (epoch + 1) % save_every == 0:
                 self._save_checkpoint(epoch + 1)
@@ -1025,6 +1068,13 @@ class KazeFlowTrainer:
                 sched._last_lr  = [lr * ratio for lr in sched._last_lr]
                 for pg in optim.param_groups:
                     pg["lr"] *= ratio
+                # Scale inner schedulers (SequentialLR) and eta_min (cosine variants).
+                for inner in getattr(sched, "_schedulers", []):
+                    inner.base_lrs = [lr * ratio for lr in inner.base_lrs]
+                    if hasattr(inner, "eta_min"):
+                        inner.eta_min *= ratio
+                if hasattr(sched, "eta_min"):
+                    sched.eta_min *= ratio
                 logger.info(
                     f"LR override: {ckpt_base:.2e} → {new_base:.2e} (ratio {ratio:.4f})"
                 )
@@ -1078,13 +1128,16 @@ class KazeFlowTrainer:
         self.epoch = ckpt["epoch"]
         self.global_step = ckpt["global_step"]
         self._eval_count = ckpt.get("eval_count", 0)
-        # If transitioning exponential → cosine, rebuild the scheduler at the
-        # correct position in the cosine cycle using last_epoch.
-        if _sched_type_now != _sched_type_ckpt and _sched_type_now == "cosine":
+        # If transitioning scheduler types, rebuild schedulers positioned at the
+        # current epoch so the LR curve continues smoothly from where training left off.
+        if _sched_type_now != _sched_type_ckpt and _sched_type_now in ("cosine", "cosine_warmup_restarts"):
             _tc = self.config["train"]
             _T = _tc["epochs"]
-            _vw = _tc.get("vocoder_warmup_epochs", 0)
             _er = _tc.get("lr_eta_min_ratio", 0.01)
+            _wu = _tc.get("lr_warmup_epochs", 0)
+            _rp = _tc.get("disc_restart_period", 50)
+            _rm = _tc.get("disc_restart_mult", 2)
+
             def _cosine_at(optim, t_max, at_ep):
                 _base = optim.param_groups[0]["lr"]
                 return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1092,11 +1145,25 @@ class KazeFlowTrainer:
                     eta_min=_base * _er,
                     last_epoch=max(0, at_ep - 1),
                 )
-            self.sched_flow    = _cosine_at(self.optim_flow,    _T,       self.epoch)
-            self.sched_vocoder = _cosine_at(self.optim_vocoder, _T,       self.epoch)
-            self.sched_disc    = _cosine_at(self.optim_disc,    _T - _vw, max(0, self.epoch - _vw))
-            logger.info(
-                f"Cosine schedulers rebuilt at epoch {self.epoch} "
-                f"(T_max flow/voc={_T}, disc={_T-_vw})"
-            )
+
+            if _sched_type_now == "cosine":
+                self.sched_flow    = _cosine_at(self.optim_flow,    _T, self.epoch)
+                self.sched_vocoder = _cosine_at(self.optim_vocoder, _T, self.epoch)
+                self.sched_disc    = _cosine_at(self.optim_disc,    _T, self.epoch)
+                logger.info(
+                    f"Cosine schedulers rebuilt at epoch {self.epoch} "
+                    f"(T_max={_T})"
+                )
+            else:  # cosine_warmup_restarts
+                _flow_ep = max(0, self.epoch - _wu)
+                self.sched_flow    = _cosine_at(self.optim_flow,    max(1, _T - _wu), _flow_ep)
+                self.sched_vocoder = _cosine_at(self.optim_vocoder, max(1, _T - _wu), _flow_ep)
+                _disc_base = self.optim_disc.param_groups[0]["lr"]
+                self.sched_disc = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self.optim_disc, T_0=max(1, _rp), T_mult=_rm,
+                    eta_min=_disc_base * _er, last_epoch=self.epoch)
+                logger.info(
+                    f"cosine_warmup_restarts schedulers rebuilt at epoch {self.epoch} "
+                    f"(T={_T}, warmup={_wu}, disc_restart={_rp}x{_rm})"
+                )
         logger.info(f"Resumed from {path} (epoch {self.epoch}, step {self.global_step})")

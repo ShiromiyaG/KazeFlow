@@ -71,14 +71,19 @@ def _mel_spec(x: torch.Tensor, n_fft: int, hop_length: int,
     return log_mel
 
 
+@torch.amp.autocast("cuda", enabled=False)
 def feature_loss(fmap_r: List[List[torch.Tensor]],
                  fmap_g: List[List[torch.Tensor]]) -> torch.Tensor:
-    """Feature matching loss (L1 between discriminator feature maps)."""
+    """Feature matching loss (L1 between discriminator feature maps).
+
+    Forced to FP32 — feature maps under autocast are FP16, and accumulated
+    L1 differences lose precision when many layers are summed.
+    """
     loss = 0.0
     n_layers = 0
     for dr, dg in zip(fmap_r, fmap_g):
         for rl, gl in zip(dr, dg):
-            loss += torch.mean(torch.abs(rl - gl))
+            loss += torch.mean(torch.abs(rl.float() - gl.float()))
             n_layers += 1
     if n_layers > 0:
         return 2 * loss / n_layers
@@ -244,12 +249,16 @@ class LeCamEMA:
 
     def penalty(self, real_preds: List[torch.Tensor],
                 fake_preds: List[torch.Tensor]) -> torch.Tensor:
-        """Compute LeCam penalty across all sub-discriminators (mean)."""
+        """Compute LeCam penalty across all sub-discriminators (mean).
+
+        Forced to FP32 — disc predictions may arrive in FP16 and
+        .pow(2) can overflow FP16 max (65504) if outputs grow.
+        """
         loss = torch.tensor(0.0, device=real_preds[0].device)
         for r_pred in real_preds:
-            loss = loss + torch.relu(r_pred - self.ema_fake).pow(2).mean()
+            loss = loss + torch.relu(r_pred.float() - self.ema_fake).pow(2).mean()
         for f_pred in fake_preds:
-            loss = loss + torch.relu(self.ema_real - f_pred).pow(2).mean()
+            loss = loss + torch.relu(self.ema_real - f_pred.float()).pow(2).mean()
         n = max(len(real_preds) + len(fake_preds), 1)
         return loss / n
 

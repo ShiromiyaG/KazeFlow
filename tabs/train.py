@@ -49,48 +49,49 @@ def get_models_list() -> list:
     ])
 
 
-def get_pretrain_checkpoints_list() -> list:
-    """List pretrain checkpoint .pt files in logs/."""
-    results = []
-    for root, _, files in os.walk(_LOGS_DIR):
-        for f in sorted(files):
-            if f.endswith(".pt") and not f.startswith(("G_", "D_")):
-                results.append(os.path.relpath(os.path.join(root, f), _NOW_DIR))
-    return sorted(results)
+_CHECKPOINTS_DIR = _NOW_DIR / "assets" / "checkpoints"
+
+
+def get_asset_checkpoints_list() -> list:
+    """List .pt files in assets/checkpoints/ (pretrained base weights)."""
+    if not _CHECKPOINTS_DIR.exists():
+        return []
+    return sorted(
+        os.path.relpath(os.path.join(root, f), _NOW_DIR)
+        for root, _, files in os.walk(_CHECKPOINTS_DIR)
+        for f in files
+        if f.endswith(".pt")
+    )
+
+
+def get_resume_checkpoints_list() -> list:
+    """List checkpoint .pt files in logs/ (training run checkpoints)."""
+    if not _LOGS_DIR.exists():
+        return []
+    return sorted(
+        os.path.relpath(os.path.join(root, f), _NOW_DIR)
+        for root, _, files in os.walk(_LOGS_DIR)
+        for f in files
+        if f.endswith(".pt") and not f.startswith(("G_", "D_"))
+    )
 
 
 def refresh_train_lists(current_pretrain: str, current_resume: str):
     """Refresh all dropdowns; clear value if the selected file no longer exists."""
-    ckpts = get_pretrain_checkpoints_list()
+    asset_ckpts = get_asset_checkpoints_list()
+    resume_ckpts = get_resume_checkpoints_list()
     return (
         gr.update(choices=get_datasets_list()),
         gr.update(choices=get_models_list()),
         gr.update(
-            choices=ckpts,
-            value=current_pretrain if current_pretrain in ckpts else None,
+            choices=asset_ckpts,
+            value=current_pretrain if current_pretrain in asset_ckpts else None,
         ),
         gr.update(
-            choices=ckpts,
-            value=current_resume if current_resume in ckpts else None,
+            choices=resume_ckpts,
+            value=current_resume if current_resume in resume_ckpts else None,
         ),
     )
-
-
-# ---------------------------------------------------------------------------
-# Auto schedule
-# ---------------------------------------------------------------------------
-
-def compute_auto_schedule(total_epochs: int) -> dict:
-    """Compute smart defaults for warmup/ramp values (finetuning)."""
-    vocoder_warmup = 0  # pretrained vocoder, no warmup needed
-    gan_ramp = max(5, min(20, int(total_epochs * 0.05)))
-    ode_ramp = max(20, int(total_epochs * 0.40))
-    return {
-        "vocoder_warmup_epochs": vocoder_warmup,
-        "gan_ramp_epochs": gan_ramp,
-        "ode_ramp_epochs": ode_ramp,
-        "progressive_ode": True,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -262,17 +263,21 @@ def start_training(
     resume_path: str,
     content_embedder: str,
     architecture: str,
+    vocoder_type: str,
     # Advanced
     precision: str,
     torch_compile: bool,
     compile_mode: str,
     lr_scheduler: str,
     gan_loss_type: str,
-    vocoder_warmup: int,
-    gan_ramp_epochs: int,
+    gradient_balancer: bool,
     progressive_ode: bool,
     ode_ramp_epochs: int,
-    auto_schedule: bool,
+    # AFM (v2)
+    afm_c_afm: float = 0.1,
+    afm_adv_every: int = 2,
+    afm_ramp_epochs: int = 30,
+    afm_curriculum_epochs: int = 60,
 ):
     """Start training in a background thread."""
     global _training_thread, _training_status
@@ -300,7 +305,8 @@ def start_training(
                 logger.info(f"Loaded existing config from {existing_cfg}")
             else:
                 from kazeflow.configs import load_config
-                config = load_config(sample_rate=sample_rate)
+                _vtype = vocoder_type if vocoder_type != "chouwa_gan" else None
+                config = load_config(sample_rate=sample_rate, vocoder_type=_vtype)
 
             # Apply UI overrides
             config["train"]["precision"] = precision
@@ -308,6 +314,7 @@ def start_training(
             config["train"]["compile_mode"] = compile_mode
             config["train"]["lr_scheduler"] = lr_scheduler
             config["train"]["gan_loss_type"] = gan_loss_type
+            config["train"]["use_gradient_balancer"] = gradient_balancer
             config["preprocess"]["content_embedder"] = content_embedder
 
             from kazeflow.models.embedder import EMBEDDER_DIMS
@@ -320,21 +327,23 @@ def start_training(
             if epochs > 0:
                 config["train"]["epochs"] = epochs
 
-            # Auto schedule or manual overrides
-            _total = config["train"]["epochs"]
-            if auto_schedule:
-                sched = compute_auto_schedule(_total)
-                for k, v in sched.items():
-                    config["train"][k] = v
-            else:
-                config["train"]["vocoder_warmup_epochs"] = int(vocoder_warmup)
-                config["train"]["gan_ramp_epochs"] = int(gan_ramp_epochs)
-                config["train"]["progressive_ode"] = progressive_ode
-                config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
+            config["train"]["progressive_ode"] = progressive_ode
+            config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
 
             import torch
 
             is_v2 = architecture == "v2"
+
+            # AFM config (v2 architecture)
+            # If an afm block already exists in the saved config, preserve it.
+            # Only write a new one if there's no existing afm block.
+            if is_v2 and config["train"].get("afm") is None:
+                config["train"]["afm"] = {
+                    "c_afm": float(afm_c_afm),
+                    "adv_every": int(afm_adv_every),
+                    "ramp_epochs": int(afm_ramp_epochs),
+                    "curriculum_epochs": int(afm_curriculum_epochs),
+                }
 
             if is_v2:
                 from kazeflow.train.trainer_v2 import KazeFlowV2Trainer
@@ -411,16 +420,16 @@ def create_training_tab():
         # ── Model Settings ─────────────────────────────────────────────
         with gr.Group():
             gr.Markdown("### Model Settings")
-            with gr.Row():
+            with gr.Row(equal_height=True):
                 model_name = gr.Dropdown(
                     label="Model Name",
                     choices=get_models_list(),
                     interactive=True,
                     allow_custom_value=True,
                     info="Output goes to logs/<name>/",
-                    scale=4,
+                    scale=6,
                 )
-                refresh_btn = gr.Button("🔄 Refresh", size="sm", min_width=80, scale=0)
+                refresh_btn = gr.Button("🔄", size="sm", min_width=36, scale=0)
             sample_rate = gr.Radio(
                     label="Sample Rate",
                     choices=[32000, 40000, 44100, 48000],
@@ -431,7 +440,13 @@ def create_training_tab():
                     label="Architecture",
                     choices=["v1", "v2"],
                     value="v2",
-                    info="v1: Flow Matching + ChouwaGAN. v2: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
+                    info="v1: Flow Matching. v2: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
+                )
+            vocoder_type = gr.Radio(
+                    label="Vocoder",
+                    choices=["chouwa_gan"],
+                    value="chouwa_gan",
+                    info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior (8.7M params).",
                 )
 
         # ── 1. Preprocess Audio ──────────────────────────────────────────
@@ -539,17 +554,17 @@ def create_training_tab():
                 with gr.Row():
                     pretrain_ckpt = gr.Dropdown(
                         label="Pretrain Checkpoint (optional)",
-                        choices=get_pretrain_checkpoints_list(),
+                        choices=get_asset_checkpoints_list(),
                         value=None,
                         interactive=True, allow_custom_value=True,
-                        info="Load pretrained base weights.",
+                        info="Load pretrained base weights (assets/checkpoints/).",
                     )
                     resume_ckpt = gr.Dropdown(
                         label="Resume Checkpoint (optional)",
-                        choices=get_pretrain_checkpoints_list(),
+                        choices=get_resume_checkpoints_list(),
                         value=None,
                         interactive=True, allow_custom_value=True,
-                        info="Continue from a previous run.",
+                        info="Continue from a previous run (logs/).",
                     )
 
             # ── Advanced Settings ────────────────────────────────────
@@ -558,7 +573,7 @@ def create_training_tab():
                     gr.Markdown("#### Precision & Compilation")
                     precision = gr.Radio(
                         label="Precision",
-                        choices=["fp32", "fp16", "bf16", "tf32", "tf32_fp16", "tf32_bf16"],
+                        choices=["fp32", "fp32_fp16", "tf32", "tf32_fp16", "tf32_bf16"],
                         value="tf32_bf16",
                         info="tf32_bf16: recommended for Ampere+ GPUs.",
                     )
@@ -593,35 +608,57 @@ def create_training_tab():
                             value="soft_hinge",
                             info="soft_hinge: recommended (softplus disc for SAN).",
                         )
+                    gradient_balancer = gr.Checkbox(
+                        label="Gradient Balancer",
+                        value=True,
+                        info="Auto-balance mel/GAN gradient magnitudes (prevents GAN from dominating mel/STFT).",
+                    )
 
                 with gr.Group():
                     gr.Markdown("#### Warmup & Ramp")
-                    auto_schedule = gr.Checkbox(
-                        label="Auto Schedule",
-                        value=True,
-                        info="Automatically compute warmup/ramp values from total epochs.",
-                    )
-                    with gr.Row():
-                        vocoder_warmup = gr.Number(
-                            label="Vocoder Warmup (epochs)", value=0, precision=0,
-                            minimum=0, interactive=False,
-                            info="Mel-only vocoder phase before GAN activates.",
-                        )
-                        gan_ramp_epochs = gr.Number(
-                            label="GAN Ramp (epochs)", value=10, precision=0,
-                            minimum=0, interactive=False,
-                            info="Ramp GAN loss 0→1 over N epochs.",
-                        )
                     with gr.Row():
                         progressive_ode = gr.Checkbox(
                             label="Progressive ODE", value=True,
-                            interactive=False,
                             info="Ramp ODE steps from min→max over ode_ramp_epochs.",
                         )
                         ode_ramp_epochs = gr.Number(
                             label="ODE Ramp (epochs)", value=200, precision=0,
-                            minimum=0, interactive=False,
+                            minimum=0,
                             info="Epochs to ramp ODE steps.",
+                        )
+
+                with gr.Group(visible=True) as afm_group:
+                    gr.Markdown("#### AFM (v2 only)")
+                    gr.Markdown(
+                        "Adversarial Flow Matching: discriminator signal "
+                        "flows back to the flow model, teaching it to "
+                        "produce mel that sounds real when vocoded.",
+                    )
+                    with gr.Row():
+                        afm_c_afm = gr.Slider(
+                            label="AFM Strength (c_afm)",
+                            minimum=0.0, maximum=1.0, step=0.01, value=0.1,
+                            interactive=True,
+                            info="Weight of adversarial loss on flow. 0=off.",
+                        )
+                        afm_adv_every = gr.Number(
+                            label="AFM Every N batches",
+                            value=2, precision=0, minimum=1,
+                            interactive=True,
+                            info="Run adversarial path every N batches (saves VRAM).",
+                        )
+                    with gr.Row():
+                        afm_ramp_epochs = gr.Number(
+                            label="AFM Ramp (epochs)",
+                            value=30, precision=0, minimum=0,
+                            interactive=False,
+                            info="Ramp c_afm from 0→full over N epochs.",
+                        )
+                        afm_curriculum_epochs = gr.Number(
+                            label="Vocoder Curriculum (epochs)",
+                            value=60, precision=0, minimum=0,
+                            interactive=False,
+                            info="Blend vocoder input: GT mel → CFM mel over N epochs.",
                         )
 
             with gr.Row():
@@ -642,6 +679,10 @@ def create_training_tab():
             index_status = gr.Textbox(label="Index Status", interactive=False, lines=1)
 
         # --- Events ---
+        _clear_if_empty = lambda v: gr.update(value=None) if not v or not v.strip() else gr.update()
+        pretrain_ckpt.change(fn=_clear_if_empty, inputs=[pretrain_ckpt], outputs=[pretrain_ckpt])
+        resume_ckpt.change(fn=_clear_if_empty, inputs=[resume_ckpt], outputs=[resume_ckpt])
+
         refresh_btn.click(
             fn=refresh_train_lists,
             inputs=[pretrain_ckpt, resume_ckpt],
@@ -661,19 +702,11 @@ def create_training_tab():
             outputs=[reduction_strength],
         )
 
-        # Auto schedule toggle: enable/disable manual warmup fields
-        def _toggle_auto(enabled):
-            interactive = not enabled
-            return (
-                gr.update(interactive=interactive),
-                gr.update(interactive=interactive),
-                gr.update(interactive=interactive),
-                gr.update(interactive=interactive),
-            )
-        auto_schedule.change(
-            fn=_toggle_auto,
-            inputs=[auto_schedule],
-            outputs=[vocoder_warmup, gan_ramp_epochs, progressive_ode, ode_ramp_epochs],
+        # Show/hide AFM group based on architecture
+        architecture.change(
+            fn=lambda arch: gr.update(visible=arch == "v2"),
+            inputs=[architecture],
+            outputs=[afm_group],
         )
 
         preprocess_btn.click(
@@ -697,13 +730,15 @@ def create_training_tab():
             inputs=[model_name, sample_rate,
                     batch_size, save_every, training_epochs,
                     pretrain_ckpt, resume_ckpt, content_embedder,
-                    architecture,
+                    architecture, vocoder_type,
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,
-                    vocoder_warmup, gan_ramp_epochs,
+                    gradient_balancer,
                     progressive_ode, ode_ramp_epochs,
-                    auto_schedule],
+                    # AFM (v2)
+                    afm_c_afm, afm_adv_every,
+                    afm_ramp_epochs, afm_curriculum_epochs],
             outputs=[train_status],
         )
         stop_btn.click(fn=stop_training, outputs=[train_status])

@@ -147,6 +147,7 @@ def run_inference(
     f0_method: str,
     index_path: str,
     index_rate: float,
+    guidance_scale: float = 1.0,
 ):
     """Run voice conversion inference."""
     global _pipeline
@@ -180,6 +181,7 @@ def run_inference(
             ode_method=ode_method,
             f0_method=f0_method,
             index_rate=index_rate if idx_path else 0.0,
+            guidance_scale=guidance_scale,
         )
 
         # Save output
@@ -212,15 +214,15 @@ def create_inference_tab():
                 )
 
                 with gr.Group():
-                    with gr.Row():
+                    with gr.Row(equal_height=True):
                         model_selector = gr.Dropdown(
                             label="Model",
                             choices=get_available_models(),
                             interactive=True,
                             allow_custom_value=True,
-                            scale=4,
+                            scale=6,
                         )
-                        refresh_btn = gr.Button("🔄", size="sm", min_width=40, scale=0)
+                        refresh_btn = gr.Button("🔄", size="sm", min_width=36, scale=0)
 
                     speaker_id = gr.Dropdown(
                         label="Speaker ID",
@@ -256,6 +258,12 @@ def create_inference_tab():
                         choices=["rmvpe"],
                         value="rmvpe",
                     )
+
+                guidance_scale = gr.Slider(
+                    label="Guidance Scale (CFG)",
+                    minimum=1.0, maximum=5.0, step=0.1, value=1.0,
+                    info="1.0 = off. Higher = stronger speaker conditioning. Try 1.5–3.0.",
+                )
 
                 with gr.Accordion("FAISS Index", open=False):
                     index_path = gr.Dropdown(
@@ -296,7 +304,7 @@ def create_inference_tab():
             fn=run_inference,
             inputs=[audio_input, model_selector, speaker_id,
                     f0_shift, ode_steps, ode_method, f0_method,
-                    index_path, index_rate],
+                    index_path, index_rate, guidance_scale],
             outputs=[audio_output, status_text],
         )
 

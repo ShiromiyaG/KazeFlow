@@ -65,11 +65,79 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
         self.afm_ramp_epochs = afm.get("ramp_epochs", 50)
         self.curriculum_epochs = afm.get("curriculum_epochs", 100)
 
+        # ── AFM stability controls (prevent flow degradation) ────────
+        # t^alpha weighting: alpha=1 (linear) is gentler than alpha=2.
+        # Original t² kills gradient at low timesteps; linear t gives
+        # the flow useful adversarial signal across more of the ODE.
+        self.t_weight_power = afm.get("t_weight_power", 1.0)
+
+        # Weight-space anchor: L2 penalty keeping flow close to its
+        # pretrained state.  Prevents catastrophic drift when
+        # adversarial gradient conflicts with velocity matching.
+        self.c_anchor = afm.get("c_anchor", 0.001)
+
+        # Velocity-gated AFM: auto-reduce adversarial coefficient when
+        # the velocity loss rises above its running average.
+        # vel_gate_threshold=0.5 means: when vel_loss exceeds
+        # 1.5× its EMA, AFM is fully suppressed.
+        # Set to 0 to disable.
+        self.vel_gate_threshold = afm.get("vel_gate_threshold", 0.5)
+        self._vel_loss_ema = None
+        self._vel_loss_ema_decay = afm.get("vel_ema_decay", 0.99)
+
+        # AFM loss type: "feature_match" uses discriminator feature maps
+        # (L1 on intermediate layers). Smoother gradient than raw GAN loss,
+        # gives the flow multi-scale perceptual signal instead of a noisy
+        # scalar "fool the disc" objective.
+        # Options: "gen_loss" (default, lighter), "feature_match", "both"
+        self.afm_loss_type = afm.get("loss_type", "gen_loss")
+
+        # Placeholder for pretrained weight snapshot
+        self._flow_anchor = None
+
         logger.info(
             f"AFM v2: c_afm={self.c_afm}, adv_every={self.afm_every}, "
             f"ramp_epochs={self.afm_ramp_epochs}, "
-            f"curriculum_epochs={self.curriculum_epochs}"
+            f"curriculum_epochs={self.curriculum_epochs}, "
+            f"t_power={self.t_weight_power}, c_anchor={self.c_anchor}, "
+            f"vel_gate={self.vel_gate_threshold}, "
+            f"loss_type={self.afm_loss_type}"
         )
+
+    # ── Checkpoint persistence for V2-specific state ────────────────
+
+    def _save_checkpoint(self, epoch: int):
+        """Save V2 checkpoint with AFM + LeCam state."""
+        super()._save_checkpoint(epoch)
+        path = self.output_dir / f"checkpoint_{epoch}.pt"
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        ckpt["v2_vel_loss_ema"] = self._vel_loss_ema
+        if self.lecam is not None:
+            ckpt["v2_lecam"] = {
+                "ema_real": self.lecam.ema_real,
+                "ema_fake": self.lecam.ema_fake,
+                "initialized": self.lecam.initialized,
+            }
+        tmp_path = path.with_suffix(".pt.tmp")
+        torch.save(ckpt, tmp_path)
+        tmp_path.replace(path)
+
+    def _load_checkpoint(self, path):
+        """Load V2 checkpoint, restoring AFM + LeCam state."""
+        super()._load_checkpoint(path)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        if "v2_vel_loss_ema" in ckpt:
+            self._vel_loss_ema = ckpt["v2_vel_loss_ema"]
+            logger.info(f"Restored vel_loss_ema = {self._vel_loss_ema}")
+        if "v2_lecam" in ckpt and self.lecam is not None:
+            lc = ckpt["v2_lecam"]
+            self.lecam.ema_real = lc["ema_real"]
+            self.lecam.ema_fake = lc["ema_fake"]
+            self.lecam.initialized = lc["initialized"]
+            logger.info(
+                f"Restored LeCam EMA: real={self.lecam.ema_real:.4f}, "
+                f"fake={self.lecam.ema_fake:.4f}"
+            )
 
     def _freeze_params(self, *modules):
         for m in modules:
@@ -94,13 +162,24 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
         AFM finetuning loop — v1 structure with adversarial CFM signal
         and vocoder curriculum.
 
-        Phase 1 (vocoder_warmup_epochs): Mel-only vocoder training (no GAN).
-        Phase 2 (remaining epochs): CFM + adversarial path + vocoder curriculum + GAN.
+        Joint training: CFM + adversarial path + vocoder curriculum + GAN.
         """
         train_cfg = self.config["train"]
 
         if resume_path:
             self._load_checkpoint(resume_path)
+
+        # ── Snapshot pretrained flow weights for anchor regularization ──
+        # Must happen AFTER checkpoint load so we anchor to the
+        # pretrained state, not random init.
+        if self.c_anchor > 0 and self._flow_anchor is None:
+            self._flow_anchor = {
+                name: p.detach().clone().cpu()
+                for name, p in self.flow.named_parameters()
+                if p.requires_grad
+            }
+            _n_anchor = sum(p.numel() for p in self._flow_anchor.values())
+            logger.info(f"Flow weight anchor stored ({_n_anchor:,} params)")
 
         dataloader = create_dataloader(
             filelist_path=filelist_path,
@@ -120,6 +199,7 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
         log_every = train_cfg["log_every"]
 
         _log_section("Start (AFM v2 Finetune)")
+        logger.info(f"Vocoder: {self.config['model'].get('vocoder_type', 'chouwa_gan')}")
         logger.info(f"AFM finetuning for {epochs} epochs")
         logger.info(f"Dataset: {len(dataloader.dataset)} samples")
         logger.info(f"Batch size: {train_cfg['batch_size']}")
@@ -130,31 +210,13 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                 break
 
             self.epoch = epoch
-            _voc_warmup_epochs = train_cfg.get("vocoder_warmup_epochs", 0)
-            _disc_active = epoch >= _voc_warmup_epochs
 
-            if _disc_active:
-                _phase = "AFM"
-                _joint_epoch = epoch - _voc_warmup_epochs
+            # AFM ramp
+            _afm_progress = min(1.0, max(0.0, epoch / max(1, self.afm_ramp_epochs)))
+            _effective_c_afm = self.c_afm * _afm_progress
 
-                # GAN ramp
-                _gan_ramp_epochs = train_cfg.get("gan_ramp_epochs", 0)
-                if _gan_ramp_epochs > 0:
-                    _gan_ramp_factor = min(1.0, (_joint_epoch + 1) / _gan_ramp_epochs)
-                else:
-                    _gan_ramp_factor = 1.0
-
-                # AFM ramp
-                _afm_progress = min(1.0, max(0.0, _joint_epoch / max(1, self.afm_ramp_epochs)))
-                _effective_c_afm = self.c_afm * _afm_progress
-
-                # Curriculum: GT → CFM mel_hat blend
-                _curriculum_progress = min(1.0, max(0.0, _joint_epoch / max(1, self.curriculum_epochs)))
-            else:
-                _phase = "VocWarmup"
-                _gan_ramp_factor = 0.0
-                _effective_c_afm = 0.0
-                _curriculum_progress = 0.0
+            # Curriculum: GT → CFM mel_hat blend
+            _curriculum_progress = min(1.0, max(0.0, epoch / max(1, self.curriculum_epochs)))
 
             self.flow.train()
             self.vocoder.train()
@@ -162,7 +224,7 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
 
             pbar = tqdm(
                 dataloader,
-                desc=f"[{_phase}] Epoch {epoch+1}/{epochs}",
+                desc=f"[AFM] Epoch {epoch+1}/{epochs}",
                 unit="batch",
                 leave=True,
                 dynamic_ncols=True,
@@ -196,56 +258,105 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
 
                 # ── Step 1: CFM Loss (with optional AFM path) ────────
                 if _accum_cfm == 0:
-                    self.optim_flow.zero_grad()
+                    self.optim_flow.zero_grad(set_to_none=True)
 
                 loss_afm = torch.tensor(0.0, device=self.device)
+                _vel_gate = 1.0
+                _do_afm = False
 
-                if _disc_active:
-                    # V2: use forward_afm to get single-step mel prediction
-                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                # V2: use forward_afm only when AFM is active
+                with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                    if _effective_c_afm > 0:
                         loss_vel, mel_hat_afm, t_afm = self.flow.forward_afm(
                             x_1=mel, x_mask=x_mask,
                             content=spin, f0=f0_expanded, g=g,
                         )
-                    loss_cfm = loss_vel
+                    else:
+                        loss_vel = self.flow(
+                            x_1=mel, x_mask=x_mask,
+                            content=spin, f0=f0_expanded, g=g,
+                        )
+                        mel_hat_afm = None
+                        t_afm = None
+                loss_cfm = loss_vel
 
-                    # ── V2: Adversarial path ─────────────────────────
-                    # Freeze vocoder+disc so only flow gets gradient.
-                    # Gradient chain: loss_afm → disc → vocoder → mel_hat → v_t → flow
-                    _do_afm = (
-                        _effective_c_afm > 0
-                        and batch_idx % self.afm_every == 0
-                    )
-                    if _do_afm:
+                # ── V2: Adversarial path ─────────────────────────
+                # Freeze vocoder+disc so only flow gets gradient.
+                # Gradient chain: loss_afm → disc → vocoder → mel_hat → v_t → flow
+                _do_afm = (
+                    _effective_c_afm > 0
+                    and batch_idx % self.afm_every == 0
+                )
+                _vel_gate = 1.0
+                if _do_afm:
+                    # Velocity-gated AFM: suppress adversarial signal
+                    # when velocity loss is rising (flow is degrading).
+                    if (self._vel_loss_ema is not None
+                            and self.vel_gate_threshold > 0):
+                        _vel_ratio = loss_vel.item() / max(self._vel_loss_ema, 1e-8)
+                        _vel_gate = max(0.0, min(1.0,
+                            1.0 - (_vel_ratio - 1.0) / self.vel_gate_threshold))
+
+                    if _vel_gate > 0:
                         self._freeze_params(self.vocoder, self.discriminator)
                         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                             wav_afm = self.vocoder(mel_hat_afm, f0, g=g)
                             _afm_len = min(wav_afm.shape[-1], wav_gt.shape[-1])
                             wav_afm = wav_afm[..., :_afm_len]
-                            _, y_d_gs_afm, _, _ = self.discriminator(
+                            _compute_fmaps = self.afm_loss_type != "gen_loss"
+                            y_d_rs_afm, y_d_gs_afm, fmap_rs_afm, fmap_gs_afm = self.discriminator(
                                 wav_gt[..., :_afm_len].detach(), wav_afm,
-                                compute_fmaps=False)
-                            loss_afm = self._gen_loss_fn(y_d_gs_afm)
+                                compute_fmaps=_compute_fmaps)
+                            if self.afm_loss_type == "feature_match":
+                                loss_afm = feature_loss(fmap_rs_afm, fmap_gs_afm)
+                            elif self.afm_loss_type == "both":
+                                loss_afm = (
+                                    self._gen_loss_fn(y_d_gs_afm)
+                                    + feature_loss(fmap_rs_afm, fmap_gs_afm)
+                                )
+                            else:  # "gen_loss"
+                                loss_afm = self._gen_loss_fn(y_d_gs_afm)
 
-                        # t² weighting: adversarial signal meaningful only at high t
-                        t_weight = (t_afm ** 2).mean()
-                        loss_cfm = loss_cfm + _effective_c_afm * t_weight * loss_afm
-
-                        # Log AFM loss immediately
-                        _afm_val = loss_afm.item()
-                        if math.isfinite(_afm_val):
-                            self.writer.add_scalar("loss/afm", _afm_val, self.global_step)
-                        _afm_loss_accum += _afm_val if math.isfinite(_afm_val) else 0.0
-                        _afm_loss_count += 1
+                        # t^alpha weighting (default alpha=1, softer than original t²)
+                        t_weight = (t_afm ** self.t_weight_power).mean()
+                        loss_cfm = loss_cfm + (
+                            _vel_gate * _effective_c_afm * t_weight * loss_afm
+                        )
 
                         self._unfreeze_params(self.vocoder, self.discriminator)
-                else:
-                    # Vocoder warmup: regular v1 CFM forward
-                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                        loss_cfm = self.flow(
-                            x_1=mel, x_mask=x_mask,
-                            content=spin, f0=f0_expanded, g=g,
+
+                    # Log AFM loss immediately
+                    _afm_val = loss_afm.item()
+                    if math.isfinite(_afm_val):
+                        self.writer.add_scalar("loss/afm", _afm_val, self.global_step)
+                    _afm_loss_accum += _afm_val if math.isfinite(_afm_val) else 0.0
+                    _afm_loss_count += 1
+
+                # Update velocity loss EMA (tracks flow health)
+                _vel_val = loss_vel.item()
+                if math.isfinite(_vel_val):
+                    if self._vel_loss_ema is None:
+                        self._vel_loss_ema = _vel_val
+                    else:
+                        self._vel_loss_ema = (
+                            self._vel_loss_ema_decay * self._vel_loss_ema
+                            + (1.0 - self._vel_loss_ema_decay) * _vel_val
                         )
+
+                # ── Weight-space anchor: prevent drift from pretrained flow ──
+                # L2 penalty on parameter distance from snapshot.
+                # This is the single most effective defence against
+                # adversarial gradient corrupting the velocity field,
+                # because it keeps the flow in a basin near the
+                # pretrained solution even when AFM pushes hard.
+                _anchor_loss = torch.tensor(0.0, device=self.device)
+                if self._flow_anchor is not None:
+                    _anchor_loss = sum(
+                        (p - self._flow_anchor[name].to(p.device)).square().sum()
+                        for name, p in self.flow.named_parameters()
+                        if name in self._flow_anchor and p.requires_grad
+                    ) / sum(p.numel() for p in self._flow_anchor.values())
+                    loss_cfm = loss_cfm + self.c_anchor * _anchor_loss
 
                 # NaN guard
                 if not torch.isfinite(loss_cfm):
@@ -272,22 +383,37 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                     self.ema_flow.update()
                     _accum_cfm = 0
 
-                # ── Step 2: Generate mel from flow (for vocoder) ─────
-                if _ode_min_cfg >= _eff_ode_max:
-                    _ode_n = _ode_min_cfg
-                else:
-                    _ode_n = int(round(math.exp(
-                        random.uniform(math.log(_ode_min_cfg), math.log(_eff_ode_max)))))
+                _loss_cfm_val = loss_cfm.item()
+                if _do_afm:
+                    del loss_cfm, loss_vel, mel_hat_afm, t_afm
+                # When mel_hat_afm was computed this step, use it (detached)
+                # for the vocoder instead of running a separate ODE sample.
+                # This closes the distribution gap: the vocoder learns to
+                # decode the same single-step mels that AFM optimises.
+                _used_afm_mel = False
+                if _do_afm and _vel_gate > 0:
+                    # mel_hat_afm quality varies with t — only use samples
+                    # where mean t is high enough (mel_hat is decent).
+                    if t_afm.mean().item() > 0.4:
+                        mel_hat = mel_hat_afm.detach()
+                        _used_afm_mel = True
 
-                self.flow.eval()
-                with torch.no_grad():
-                    mel_hat = self.flow.sample(
-                        content=spin, f0=f0_expanded,
-                        x_mask=x_mask, g=g,
-                        n_steps=_ode_n,
-                        method=train_cfg.get("ode_method_train", "euler"),
-                    )
-                self.flow.train()
+                if not _used_afm_mel:
+                    if _ode_min_cfg >= _eff_ode_max:
+                        _ode_n = _ode_min_cfg
+                    else:
+                        _ode_n = int(round(math.exp(
+                            random.uniform(math.log(_ode_min_cfg), math.log(_eff_ode_max)))))
+
+                    self.flow.eval()
+                    with torch.no_grad():
+                        mel_hat = self.flow.sample(
+                            content=spin, f0=f0_expanded,
+                            x_mask=x_mask, g=g,
+                            n_steps=_ode_n,
+                            method=train_cfg.get("ode_method_train", "euler"),
+                        )
+                    self.flow.train()
 
                 # ── Step 3: Vocoder (mel → waveform) ─────────────────
                 # V2 CHANGE: Curriculum vocoder input — smooth blend
@@ -313,8 +439,8 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                 loss_disc = torch.tensor(0.0, device=self.device)
                 loss_lecam = torch.tensor(0.0, device=self.device)
                 _apply_r1 = False
-                for _disc_i in range(self.n_disc_steps if _disc_active else 0):
-                    self.optim_disc.zero_grad()
+                for _disc_i in range(self.n_disc_steps):
+                    self.optim_disc.zero_grad(set_to_none=True)
                     _apply_r1 = (self.c_r1 > 0
                                  and self.global_step % self.r1_interval == 0)
                     if _apply_r1:
@@ -358,18 +484,14 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                     d_real_mean, d_fake_mean = _d_real, _d_fake
 
                 # ── Step 5: Generator (vocoder) losses ───────────────
-                self.optim_vocoder.zero_grad()
+                self.optim_vocoder.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                    if _disc_active:
-                        y_d_rs, y_d_gs, fmap_rs, fmap_gs = self.discriminator(
-                            wav_real_detached, wav_hat, compute_fmaps=True,
-                        )
-                        loss_gen = self._gen_loss_fn(y_d_gs)
-                        loss_fm = feature_loss(fmap_rs, fmap_gs)
-                    else:
-                        loss_gen = torch.tensor(0.0, device=self.device)
-                        loss_fm = torch.tensor(0.0, device=self.device)
+                    y_d_rs, y_d_gs, fmap_rs, fmap_gs = self.discriminator(
+                        wav_real_detached, wav_hat, compute_fmaps=True,
+                    )
+                    loss_gen = self._gen_loss_fn(y_d_gs)
+                    loss_fm = feature_loss(fmap_rs, fmap_gs)
 
                     loss_mel = mel_spectrogram_loss(
                         wav_real_detached, wav_hat,
@@ -399,17 +521,36 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                     self.optim_vocoder.zero_grad(set_to_none=True)
                     gn_voc = None
                 else:
-                    loss_voc_total = (
-                        _gan_ramp_factor * self.c_gen * loss_gen
-                        + _gan_ramp_factor * self.c_fm * loss_fm
-                        + self.c_mel * loss_mel
-                        + self.c_mrstft * loss_mrstft
-                    )
-                    self.scaler_gen.scale(loss_voc_total).backward()
-                    self.scaler_gen.unscale_(self.optim_vocoder)
-                    gn_voc = torch.nn.utils.clip_grad_norm_(
-                        self.vocoder.parameters(), self.grad_clip_voc)
-                    self.scaler_gen.step(self.optim_vocoder)
+                    if self.gradient_balancer is not None:
+                        _voc_losses = {
+                            "gen": loss_gen,
+                            "fm": loss_fm,
+                            "mel": loss_mel,
+                            "mrstft": loss_mrstft,
+                        }
+                        _ref_param = next(self.vocoder.parameters())
+                        loss_voc_total = self.gradient_balancer.backward(
+                            _voc_losses, _ref_param,
+                            scaler=self.scaler_gen if self._needs_scaler else None,
+                        )
+                        if not self._needs_scaler:
+                            pass  # backward already called by balancer
+                        self.scaler_gen.unscale_(self.optim_vocoder)
+                        gn_voc = torch.nn.utils.clip_grad_norm_(
+                            self.vocoder.parameters(), self.grad_clip_voc)
+                        self.scaler_gen.step(self.optim_vocoder)
+                    else:
+                        loss_voc_total = (
+                            self.c_gen * loss_gen
+                            + self.c_fm * loss_fm
+                            + self.c_mel * loss_mel
+                            + self.c_mrstft * loss_mrstft
+                        )
+                        self.scaler_gen.scale(loss_voc_total).backward()
+                        self.scaler_gen.unscale_(self.optim_vocoder)
+                        gn_voc = torch.nn.utils.clip_grad_norm_(
+                            self.vocoder.parameters(), self.grad_clip_voc)
+                        self.scaler_gen.step(self.optim_vocoder)
                     self.ema_vocoder.update()
 
                 if _do_flow_step:
@@ -419,7 +560,7 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
 
                 # ── Logging ──────────────────────────────────────────
                 pbar.set_postfix(
-                    cfm=f"{loss_cfm.item():.4f}",
+                    cfm=f"{_loss_cfm_val:.4f}",
                     afm=f"{loss_afm.item():.3f}" if _effective_c_afm > 0 else "off",
                     mel=f"{loss_mel.item():.4f}",
                     gen=f"{loss_gen.item():.4f}",
@@ -429,7 +570,7 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                 if self.global_step % log_every == 0:
                     step = self.global_step
                     # Losses
-                    self.writer.add_scalar("loss/cfm", loss_cfm.item(), step)
+                    self.writer.add_scalar("loss/cfm", _loss_cfm_val, step)
                     self.writer.add_scalar("loss/disc", loss_disc.item(), step)
                     self.writer.add_scalar("loss/gen", loss_gen.item(), step)
                     self.writer.add_scalar("loss/fm", loss_fm.item(), step)
@@ -441,6 +582,12 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                     self.writer.add_scalar("loss/afm_avg", _afm_avg, step)
                     self.writer.add_scalar("afm/c_effective", _effective_c_afm, step)
                     self.writer.add_scalar("afm/curriculum", _curriculum_progress, step)
+                    # AFM stability metrics
+                    self.writer.add_scalar("afm/vel_gate", _vel_gate, step)
+                    if self._vel_loss_ema is not None:
+                        self.writer.add_scalar("afm/vel_ema", self._vel_loss_ema, step)
+                    if self._flow_anchor is not None:
+                        self.writer.add_scalar("afm/anchor_loss", _anchor_loss.item(), step)
                     if gn_voc is not None:
                         self.writer.add_scalar("loss/voc_total", loss_voc_total.item(), step)
                     # Discriminator health
@@ -463,6 +610,10 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
                     # LeCam regularization
                     if self.lecam is not None:
                         self.writer.add_scalar("loss/lecam", loss_lecam.item(), step)
+                    # Gradient balancer EMA norms
+                    if self.gradient_balancer is not None and self.gradient_balancer._initialized:
+                        for name, ema_norm in self.gradient_balancer._ema_norms.items():
+                            self.writer.add_scalar(f"balancer/ema_norm_{name}", ema_norm, step)
 
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -473,8 +624,7 @@ class KazeFlowV2Trainer(KazeFlowTrainer):
 
             self.sched_flow.step()
             self.sched_vocoder.step()
-            if _disc_active:
-                self.sched_disc.step()
+            self.sched_disc.step()
 
             if (epoch + 1) % save_every == 0:
                 self._save_checkpoint(epoch + 1)

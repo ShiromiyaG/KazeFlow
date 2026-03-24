@@ -40,12 +40,14 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 def load_config(
     sample_rate: int = 48000,
     preset: Optional[str] = None,
+    vocoder_type: Optional[str] = None,
 ) -> dict:
-    """Load a layered config: base → SR overlay → preset overlay.
+    """Load a layered config: base → SR overlay → preset overlay → vocoder overlay.
 
     Args:
         sample_rate: 32000, 40000, 44100, or 48000.
         preset: None (finetune), "pretrain", or "pretrain_v2".
+        vocoder_type: None (use base default) or a registered vocoder name.
 
     Returns:
         Full materialized config dict ready to use.
@@ -83,5 +85,25 @@ def load_config(
                 config = _deep_merge(config, json.load(f))
     elif preset is not None:
         raise ValueError(f"Unknown preset '{preset}'. Available: pretrain, pretrain_v2")
+
+    # 4) Vocoder type overlay — load per-type vocoder & discriminator configs
+    if vocoder_type is not None:
+        config["model"]["vocoder_type"] = vocoder_type
+        voc_path = _CONFIGS_DIR / "vocoder" / f"{vocoder_type}.json"
+        if voc_path.exists():
+            with open(voc_path) as f:
+                voc_overlay = json.load(f)
+            voc_overlay.pop("_doc", None)
+            config["model"]["vocoder"] = _deep_merge(
+                config["model"].get("vocoder", {}), voc_overlay
+            )
+        disc_path = _CONFIGS_DIR / "discriminator" / f"{vocoder_type}.json"
+        if disc_path.exists():
+            with open(disc_path) as f:
+                disc_overlay = json.load(f)
+            disc_overlay.pop("_doc", None)
+            config["model"]["discriminator"] = _deep_merge(
+                config["model"].get("discriminator", {}), disc_overlay
+            )
 
     return config

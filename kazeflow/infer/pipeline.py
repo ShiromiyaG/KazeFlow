@@ -26,6 +26,54 @@ from kazeflow.infer.index import load_index, retrieve_and_blend
 logger = logging.getLogger("kazeflow.infer")
 
 
+def _deparametrize_state_dict(sd: dict) -> dict:
+    """Convert a parametrized weight-norm state dict to plain weights.
+
+    During training, ``torch.nn.utils.parametrizations.weight_norm`` stores
+    each weight as ``parametrizations.weight.original0`` (magnitude) and
+    ``parametrizations.weight.original1`` (direction).  At inference time
+    ``remove_weight_norm()`` collapses them back to a single ``weight``
+    tensor.  This function performs the same collapse on a state dict so
+    it can be loaded into a model that already had weight norm removed.
+
+    Also strips ``_orig_mod.`` prefixes from ``torch.compile``.
+    """
+    # Strip _orig_mod. prefixes (torch.compile)
+    if sd and all(k.startswith("_orig_mod.") for k in sd):
+        sd = {k[len("_orig_mod."):]: v for k, v in sd.items()}
+    sd = {k.replace("._orig_mod.", "."): v for k, v in sd.items()}
+
+    # Collect parametrized weight groups
+    # Keys look like: "head.conv_pre.parametrizations.weight.original0"
+    #                  "head.conv_pre.parametrizations.weight.original1"
+    param_groups: dict[str, dict[str, torch.Tensor]] = {}
+    plain = {}
+    for k, v in sd.items():
+        if ".parametrizations.weight.original" in k:
+            # "head.conv_pre.parametrizations.weight.original0" -> prefix="head.conv_pre", idx="0"
+            prefix = k.split(".parametrizations.weight.original")[0]
+            idx = k.split(".parametrizations.weight.original")[1]
+            param_groups.setdefault(prefix, {})[idx] = v
+        else:
+            plain[k] = v
+
+    # Collapse: weight = original0 * (original1 / ||original1||)
+    for prefix, parts in param_groups.items():
+        if "0" in parts and "1" in parts:
+            g = parts["0"]   # magnitude (scalar per output channel)
+            v = parts["1"]   # direction (full weight tensor)
+            # Normalize v over all dims except dim 0
+            dims = list(range(1, v.dim()))
+            norm = v.norm(2, dim=dims, keepdim=True).clamp(min=1e-12)
+            plain[f"{prefix}.weight"] = g * (v / norm)
+        elif "0" in parts:
+            plain[f"{prefix}.weight"] = parts["0"]
+        elif "1" in parts:
+            plain[f"{prefix}.weight"] = parts["1"]
+
+    return plain
+
+
 class KazeFlowPipeline:
     """End-to-end voice conversion inference."""
 
@@ -69,17 +117,12 @@ class KazeFlowPipeline:
         # Load weights
         ckpt = torch.load(checkpoint_path, map_location=self.device,
                           weights_only=False)
-        self.flow.load_state_dict(ckpt["flow"])
-
-        # Prefer EMA vocoder weights for inference (higher quality)
-        if "vocoder_ema" in ckpt:
-            self.vocoder.load_state_dict(ckpt["vocoder_ema"])
-            logger.info("Loaded EMA vocoder weights for inference")
-        else:
-            self.vocoder.load_state_dict(ckpt["vocoder"])
-            logger.info("No EMA weights found — using raw vocoder weights")
-
-        self.speaker_embed.load_state_dict(ckpt["speaker_embed"])
+        self.flow.load_state_dict(_deparametrize_state_dict(ckpt["flow"]))
+        self.vocoder.load_state_dict(
+            _deparametrize_state_dict(ckpt["vocoder"]))
+        self.speaker_embed.load_state_dict(
+            _deparametrize_state_dict(ckpt["speaker_embed"]))
+        logger.info("Loaded flow + vocoder + speaker_embed from checkpoint")
 
         # FAISS index (optional)
         self.faiss_index = None
@@ -93,8 +136,49 @@ class KazeFlowPipeline:
 
         self.sample_rate = model_cfg["sample_rate"]
         self.hop_length = model_cfg["hop_length"]
+        self.n_fft = model_cfg["n_fft"]
+        self.win_length = model_cfg["win_length"]
+        self.n_mels = model_cfg["n_mels"]
+        self._mel_basis = None
 
     # ── Feature Extraction ────────────────────────────────────────────────
+
+    def _get_mel_basis(self):
+        """Lazy-init mel filterbank (matches preprocessing pipeline)."""
+        if self._mel_basis is None:
+            self._mel_basis = torchaudio.functional.melscale_fbanks(
+                n_freqs=self.n_fft // 2 + 1,
+                f_min=0.0, f_max=self.sample_rate / 2.0,
+                n_mels=self.n_mels, sample_rate=self.sample_rate,
+            ).T.to(self.device)  # (n_mels, n_fft//2+1)
+        return self._mel_basis
+
+    @torch.no_grad()
+    def _compute_source_mel(self, audio: torch.Tensor) -> torch.Tensor:
+        """Compute log mel-spectrogram from source audio (for energy gating).
+
+        Matches the preprocessing pipeline's _compute_mel exactly.
+        """
+        if audio.dim() > 1:
+            audio = audio.squeeze(0)
+        audio = audio.float()
+
+        window = torch.hann_window(self.win_length, device=audio.device)
+        pad = (self.n_fft - self.hop_length) // 2
+        audio_padded = F.pad(
+            audio.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+        spec = torch.stft(
+            audio_padded.unsqueeze(0),
+            n_fft=self.n_fft, hop_length=self.hop_length,
+            win_length=self.win_length, window=window,
+            center=False, return_complex=True,
+        )
+        mag = spec.abs()  # (1, n_fft//2+1, T)
+
+        mel_basis = self._get_mel_basis()
+        mel = torch.matmul(mel_basis, mag.squeeze(0))  # (n_mels, T)
+        log_mel = torch.log(torch.clamp(mel, min=1e-5))
+        return log_mel.unsqueeze(0)  # (1, n_mels, T)
 
     def _get_spin_model(self):
         """Lazy-load content embedder (SPIN v2 or RSPIN)."""
@@ -114,15 +198,53 @@ class KazeFlowPipeline:
     def _extract_spin(self, audio: torch.Tensor) -> torch.Tensor:
         """
         Extract content features from 16kHz audio (SPIN v2 or RSPIN).
+        Processes in chunks to avoid OOM on long audio.
         Args:
             audio: (1, T) at 16kHz
         Returns:
             features: (1, embed_dim, T_frames)
         """
         model = self._get_spin_model()
-        with torch.no_grad():
-            features = model(audio)  # (1, T_frames, embed_dim)
-        return features.transpose(1, 2)  # (1, embed_dim, T_frames)
+        # Ensure model is on the right device (may have been offloaded to CPU)
+        model.to(self.device)
+        # ~30s chunks at 16kHz with 1s overlap for smooth transitions
+        chunk_samples = 30 * 16000   # 480000 samples
+        overlap_samples = 1 * 16000  # 16000 samples
+        T = audio.shape[1]
+
+        if T <= chunk_samples:
+            with torch.no_grad():
+                features = model(audio)  # (1, T_frames, embed_dim)
+            return features.transpose(1, 2)
+
+        # Chunked extraction
+        stride = chunk_samples - overlap_samples
+        chunks_out = []
+        start = 0
+        while start < T:
+            end = min(start + chunk_samples, T)
+            chunk = audio[:, start:end]
+            with torch.no_grad():
+                feat = model(chunk)  # (1, T_frames, embed_dim)
+            # For overlapping regions, only keep the non-overlapping part
+            # except for the first chunk where we keep everything,
+            # and for subsequent chunks we skip the overlap frames
+            if start == 0:
+                chunks_out.append(feat)
+            else:
+                # Estimate how many frames correspond to the overlap
+                # Frames = samples / hop (16kHz / 320 = 50 Hz for SPIN)
+                overlap_frames = overlap_samples // 320
+                if overlap_frames < feat.shape[1]:
+                    chunks_out.append(feat[:, overlap_frames:, :])
+                else:
+                    chunks_out.append(feat)
+            start += stride
+            if end == T:
+                break
+
+        features = torch.cat(chunks_out, dim=1)  # (1, total_frames, embed_dim)
+        return features.transpose(1, 2)
 
     def _extract_f0(self, audio: torch.Tensor, sr: int,
                     method: str = "rmvpe") -> torch.Tensor:
@@ -161,6 +283,10 @@ class KazeFlowPipeline:
                     "Run app.py to trigger the automatic prerequisites download."
                 )
             self._rmvpe_model = RMVPE0Predictor(str(weights), device=self.device)
+        else:
+            # Restore to GPU if previously offloaded
+            self._rmvpe_model.model.to(self.device)
+            self._rmvpe_model.device = self.device
         return self._rmvpe_model
 
     def _extract_f0_rmvpe(self, audio: np.ndarray, sr: int) -> np.ndarray:
@@ -214,22 +340,84 @@ class KazeFlowPipeline:
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
 
-        # Resample to 16kHz for SPIN v2
-        if sr != 16000:
-            audio_16k = torchaudio.functional.resample(audio, sr, 16000)
-        else:
-            audio_16k = audio
+        # ── Preprocessing: match training data pipeline ──────────────
+        # The preprocessing pipeline applies highpass filtering, loudness
+        # normalization, and energy-gating before saving features.  We
+        # must replicate these steps here so the SPIN/F0 features match
+        # what the flow model was trained on.
 
-        # Resample to model sample rate for F0
+        # Resample to model sample rate first (preprocessing works at
+        # model sr, then derives 16kHz from that)
         if sr != self.sample_rate:
             audio_model_sr = torchaudio.functional.resample(
                 audio, sr, self.sample_rate)
         else:
-            audio_model_sr = audio
+            audio_model_sr = audio.clone()
 
-        # Extract features
+        # Highpass filter (remove DC / low-frequency rumble)
+        preproc_cfg = self.config.get("preprocess", {})
+        hp_freq = preproc_cfg.get("highpass_freq", 48)
+        if hp_freq > 0:
+            audio_model_sr = torchaudio.functional.highpass_biquad(
+                audio_model_sr, self.sample_rate, hp_freq)
+
+        # Loudness normalization (simple RMS-based, matches preprocessing)
+        target_db = preproc_cfg.get("target_db", -23.0)
+        rms = audio_model_sr.pow(2).mean().sqrt()
+        if rms > 1e-6:
+            target_rms = 10 ** (target_db / 20)
+            audio_model_sr = audio_model_sr * (target_rms / rms)
+
+        # Derive 16kHz from the preprocessed audio (same path as training)
+        audio_16k = torchaudio.functional.resample(
+            audio_model_sr, self.sample_rate, 16000)
+
+        # Extract features — order matters for VRAM management:
+        # 1. F0 (small RMVPE model)
+        # 2. SPIN (large WavLM backbone)
+        # 3. Offload both to CPU before flow + vocoder
+
+        f0 = self._extract_f0(
+            audio_model_sr.squeeze(0), self.sample_rate, method=f0_method
+        )  # (1, 1, T_f0)
+
         audio_16k = audio_16k.to(self.device)
-        spin_features = self._extract_spin(audio_16k)  # (1, 768, T_spin)
+        spin_features = self._extract_spin(audio_16k)  # (1, embed_dim, T_spin)
+
+        # ── Energy-gate SPIN features ────────────────────────────────
+        # During preprocessing, SPIN features are zeroed in silent frames
+        # using a mel-energy gate.  Without this, the flow model sees
+        # non-zero SPIN in silence and generates noise where there should
+        # be nothing.
+        # Compute mel from source audio for gating (matches preprocessing)
+        mel_for_gate = self._compute_source_mel(
+            audio_model_sr.to(self.device))  # (1, n_mels, T_mel)
+        mel_energy = mel_for_gate.mean(dim=1)  # (1, T_mel)
+
+        # Interpolate mel energy to SPIN frame rate
+        if mel_energy.shape[1] != spin_features.shape[2]:
+            mel_energy = F.interpolate(
+                mel_energy.unsqueeze(1),
+                size=spin_features.shape[2],
+                mode="linear", align_corners=False,
+            ).squeeze(1)  # (1, T_spin)
+
+        silence_floor = float(torch.tensor(1e-5).log().item())  # ≈ -11.5
+        energy_above_floor = mel_energy - silence_floor
+        gate = torch.sigmoid(energy_above_floor - 1.0)  # (1, T_spin)
+        spin_features = spin_features * gate.unsqueeze(1)  # (1, C, T) * (1, 1, T)
+        logger.info("Energy-gated SPIN: %.1f%% frames silenced (gate<0.1)",
+                     100 * (gate < 0.1).float().mean().item())
+
+        del mel_for_gate, mel_energy, gate
+
+        # Free feature extraction models from GPU
+        if self._spin_model is not None:
+            self._spin_model.cpu()
+        if self._rmvpe_model is not None:
+            self._rmvpe_model.model.cpu()
+        del audio_16k, audio_model_sr
+        torch.cuda.empty_cache()
 
         # FAISS index retrieval (blend source features with target speaker)
         if self.faiss_index is not None and index_rate > 0.0:
@@ -237,10 +425,6 @@ class KazeFlowPipeline:
                 spin_features, self.faiss_index,
                 index_rate=index_rate, k=8, temperature=0.25,
             )
-
-        f0 = self._extract_f0(
-            audio_model_sr.squeeze(0), self.sample_rate, method=f0_method
-        )  # (1, 1, T_f0)
 
         # Apply pitch shift (semitones → frequency ratio)
         if f0_shift != 0:
@@ -268,6 +452,8 @@ class KazeFlowPipeline:
         x_mask = torch.ones(1, 1, min_len, device=self.device)
 
         # Flow matching: generate mel from content + f0 + speaker
+        # NOTE: ODE solver MUST run in float32 — float16 accumulates
+        # catastrophic error over multiple integration steps.
         mel_hat = self.flow.sample(
             content=spin_features,
             f0=f0,
@@ -278,11 +464,75 @@ class KazeFlowPipeline:
             guidance_scale=guidance_scale,
         )
 
-        # Vocoder: mel → waveform
-        f0_squeezed = f0.squeeze(1)  # (1, T)
-        waveform = self.vocoder(mel_hat, f0_squeezed, g=g)
+        # Free flow intermediates before vocoder
+        del spin_features, x_mask
+        torch.cuda.empty_cache()
 
-        return waveform.squeeze()  # (T_audio,)
+        # Diagnostic: log mel_hat statistics to verify flow output quality
+        logger.info(
+            "mel_hat stats: shape=%s  min=%.3f  max=%.3f  mean=%.3f  std=%.3f",
+            list(mel_hat.shape), mel_hat.min().item(), mel_hat.max().item(),
+            mel_hat.mean().item(), mel_hat.std().item(),
+        )
+
+        # Vocoder: mel → waveform (chunked for long audio to avoid OOM)
+        f0_squeezed = f0.squeeze(1)  # (1, T)
+        del f0
+
+        _chunk_frames = 400   # ~4s at 100Hz frame rate
+        _overlap_frames = 16  # overlap for smooth crossfade
+        T_mel = mel_hat.shape[2]
+
+        if T_mel <= _chunk_frames:
+            waveform = self.vocoder(mel_hat, f0_squeezed, g=g)
+        else:
+            _stride = _chunk_frames - _overlap_frames
+            _hop = self.hop_length
+            _xfade_samples = _overlap_frames * _hop
+            wav_chunks = []
+            prev_overlap = None  # saved tail from previous chunk
+
+            pos = 0
+            while pos < T_mel:
+                end = min(pos + _chunk_frames, T_mel)
+                mel_chunk = mel_hat[:, :, pos:end]
+                f0_chunk = f0_squeezed[:, pos:end]
+
+                wav_chunk = self.vocoder(mel_chunk, f0_chunk, g=g)
+                wav_chunk = wav_chunk.float().squeeze(0).squeeze(0)
+
+                if prev_overlap is not None:
+                    # Crossfade: blend previous chunk tail with current chunk head
+                    cur_head = wav_chunk[:_xfade_samples]
+                    fade_in = torch.linspace(0, 1, _xfade_samples, device=wav_chunk.device)
+                    blended = prev_overlap * (1 - fade_in) + cur_head * fade_in
+                    wav_chunks.append(blended)
+                    body_start = _xfade_samples
+                else:
+                    body_start = 0
+
+                if end < T_mel:
+                    # Save tail for crossfade, emit body without tail
+                    prev_overlap = wav_chunk[-_xfade_samples:].clone()
+                    wav_chunks.append(wav_chunk[body_start:-_xfade_samples])
+                else:
+                    # Last chunk: emit everything remaining
+                    wav_chunks.append(wav_chunk[body_start:])
+                    prev_overlap = None
+
+                pos += _stride
+                del mel_chunk, f0_chunk, wav_chunk
+                torch.cuda.empty_cache()
+
+            waveform = torch.cat(wav_chunks, dim=0).unsqueeze(0)
+
+        wav_out = waveform.float().squeeze()  # (T_audio,)
+        logger.info(
+            "waveform stats: len=%d  min=%.4f  max=%.4f  abs_mean=%.4f",
+            wav_out.shape[0], wav_out.min().item(), wav_out.max().item(),
+            wav_out.abs().mean().item(),
+        )
+        return wav_out
 
     def save_audio(self, waveform: torch.Tensor, output_path: str):
         """Save waveform to file."""

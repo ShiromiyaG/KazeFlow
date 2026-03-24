@@ -73,25 +73,6 @@ def refresh_pretrain_lists(current_resume: str):
 
 
 # ---------------------------------------------------------------------------
-# Auto schedule
-# ---------------------------------------------------------------------------
-
-def compute_auto_schedule_pretrain(total_epochs: int) -> dict:
-    """Compute smart defaults for warmup/ramp values (pretraining)."""
-    cfm_warmup = max(10, int(total_epochs * 0.10))
-    vocoder_warmup = max(5, int(total_epochs * 0.07))
-    gan_ramp = max(5, min(20, int(total_epochs * 0.05)))
-    ode_ramp = max(20, int((total_epochs - cfm_warmup) * 0.55))
-    return {
-        "cfm_warmup_epochs": cfm_warmup,
-        "vocoder_warmup_epochs": vocoder_warmup,
-        "gan_ramp_epochs": gan_ramp,
-        "ode_ramp_epochs": ode_ramp,
-        "progressive_ode": True,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Preprocessing (split: audio slicing + feature extraction)
 # ---------------------------------------------------------------------------
 
@@ -243,17 +224,15 @@ def start_pretraining(
     resume_path: str,
     content_embedder: str,
     architecture: str,
+    vocoder_type: str,
     # Advanced
     precision: str,
     torch_compile: bool,
     compile_mode: str,
     lr_scheduler: str,
     gan_loss_type: str,
-    vocoder_warmup: int,
-    gan_ramp_epochs: int,
     progressive_ode: bool,
     ode_ramp_epochs: int,
-    auto_schedule: bool,
 ):
     """Start pretraining in a background thread."""
     global _pretrain_thread, _pretrain_status
@@ -285,7 +264,8 @@ def start_pretraining(
             else:
                 from kazeflow.configs import load_config
                 preset = "pretrain_v2" if is_v2 else "pretrain"
-                config = load_config(sample_rate=sample_rate, preset=preset)
+                _vtype = vocoder_type if vocoder_type != "chouwa_gan" else None
+                config = load_config(sample_rate=sample_rate, preset=preset, vocoder_type=_vtype)
 
             # Apply UI overrides
             config["train"]["precision"] = precision
@@ -305,19 +285,10 @@ def start_pretraining(
             if epochs > 0:
                 config["train"]["epochs"] = epochs
 
-            # Auto schedule or manual overrides
-            _total = config["train"]["epochs"]
-            if auto_schedule:
-                sched = compute_auto_schedule_pretrain(_total)
-                for k, v in sched.items():
-                    config["train"][k] = v
-            else:
-                if cfm_warmup_epochs >= 0:
-                    config["train"]["cfm_warmup_epochs"] = int(cfm_warmup_epochs)
-                config["train"]["vocoder_warmup_epochs"] = int(vocoder_warmup)
-                config["train"]["gan_ramp_epochs"] = int(gan_ramp_epochs)
-                config["train"]["progressive_ode"] = progressive_ode
-                config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
+            if cfm_warmup_epochs >= 0:
+                config["train"]["cfm_warmup_epochs"] = int(cfm_warmup_epochs)
+            config["train"]["progressive_ode"] = progressive_ode
+            config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
 
             filelist_path = experiment_dir / "filelist.txt"
 
@@ -423,16 +394,16 @@ def create_pretrain_tab():
         # ── Model Settings ─────────────────────────────────────────────
         with gr.Group():
             gr.Markdown("### Model Settings")
-            with gr.Row():
+            with gr.Row(equal_height=True):
                 model_name = gr.Dropdown(
                     label="Model Name",
                     choices=get_models_list(),
                     interactive=True,
                     allow_custom_value=True,
                     info="Output goes to logs/<name>/",
-                    scale=4,
+                    scale=6,
                 )
-                refresh_btn = gr.Button("🔄 Refresh", size="sm", min_width=80, scale=0)
+                refresh_btn = gr.Button("🔄", size="sm", min_width=36, scale=0)
             sample_rate = gr.Radio(
                     label="Sample Rate",
                     choices=[32000, 40000, 44100, 48000],
@@ -443,7 +414,13 @@ def create_pretrain_tab():
                 label="Architecture",
                 choices=["v1", "v2"],
                 value="v2",
-                info="v1: Flow Matching + ChouwaGAN. v2: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
+                info="v1: Flow Matching. v2: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
+            )
+            vocoder_type = gr.Radio(
+                label="Vocoder",
+                choices=["chouwa_gan"],
+                value="chouwa_gan",
+                info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior (8.7M params).",
             )
 
         # ── 1. Preprocess Audio ──────────────────────────────────────────
@@ -567,7 +544,7 @@ def create_pretrain_tab():
                     gr.Markdown("#### Precision & Compilation")
                     precision = gr.Radio(
                         label="Precision",
-                        choices=["fp32", "fp16", "bf16", "tf32", "tf32_fp16", "tf32_bf16"],
+                        choices=["fp32", "fp32_fp16", "tf32", "tf32_fp16", "tf32_bf16"],
                         value="tf32_bf16",
                         info="tf32_bf16: recommended for Ampere+ GPUs.",
                     )
@@ -592,9 +569,9 @@ def create_pretrain_tab():
                     with gr.Row():
                         lr_scheduler = gr.Dropdown(
                             label="LR Scheduler",
-                            choices=["exponential", "cosine"],
-                            value="cosine",
-                            info="cosine: better convergence for long runs.",
+                            choices=["exponential", "cosine", "cosine_warmup_restarts"],
+                            value="cosine_warmup_restarts",
+                            info="cosine_warmup_restarts: warmup + cosine (recommended for pretrain).",
                         )
                         gan_loss_type = gr.Dropdown(
                             label="GAN Loss Type",
@@ -605,31 +582,14 @@ def create_pretrain_tab():
 
                 with gr.Group():
                     gr.Markdown("#### Warmup & Ramp")
-                    auto_schedule = gr.Checkbox(
-                        label="Auto Schedule",
-                        value=True,
-                        info="Automatically compute warmup/ramp values from total epochs.",
-                    )
-                    with gr.Row():
-                        vocoder_warmup = gr.Number(
-                            label="Vocoder Warmup (epochs)", value=13, precision=0,
-                            minimum=0, interactive=False,
-                            info="Mel-only vocoder phase before GAN activates.",
-                        )
-                        gan_ramp_epochs = gr.Number(
-                            label="GAN Ramp (epochs)", value=10, precision=0,
-                            minimum=0, interactive=False,
-                            info="Ramp GAN loss 0→1 over N epochs.",
-                        )
                     with gr.Row():
                         progressive_ode = gr.Checkbox(
                             label="Progressive ODE", value=True,
-                            interactive=False,
                             info="Ramp ODE steps from min→max over ode_ramp_epochs.",
                         )
                         ode_ramp_epochs = gr.Number(
                             label="ODE Ramp (epochs)", value=100, precision=0,
-                            minimum=0, interactive=False,
+                            minimum=0,
                             info="Epochs to ramp ODE steps.",
                         )
 
@@ -640,6 +600,9 @@ def create_pretrain_tab():
             train_status = gr.Textbox(label="Pretraining Status", interactive=False, lines=2)
 
         # --- Events ---
+        _clear_if_empty = lambda v: gr.update(value=None) if not v or not v.strip() else gr.update()
+        resume_ckpt.change(fn=_clear_if_empty, inputs=[resume_ckpt], outputs=[resume_ckpt])
+
         refresh_btn.click(
             fn=refresh_pretrain_lists,
             inputs=[resume_ckpt],
@@ -657,21 +620,6 @@ def create_pretrain_tab():
             fn=lambda enabled: gr.update(visible=enabled),
             inputs=[noise_reduction],
             outputs=[reduction_strength],
-        )
-
-        # Auto schedule toggle: enable/disable manual warmup fields
-        def _toggle_auto(enabled):
-            interactive = not enabled
-            return (
-                gr.update(interactive=interactive),
-                gr.update(interactive=interactive),
-                gr.update(interactive=interactive),
-                gr.update(interactive=interactive),
-            )
-        auto_schedule.change(
-            fn=_toggle_auto,
-            inputs=[auto_schedule],
-            outputs=[vocoder_warmup, gan_ramp_epochs, progressive_ode, ode_ramp_epochs],
         )
 
         preprocess_btn.click(
@@ -695,13 +643,11 @@ def create_pretrain_tab():
             inputs=[model_name, sample_rate,
                     batch_size, save_every, total_epochs,
                     cfm_warmup, resume_ckpt, content_embedder,
-                    architecture,
+                    architecture, vocoder_type,
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,
-                    vocoder_warmup, gan_ramp_epochs,
-                    progressive_ode, ode_ramp_epochs,
-                    auto_schedule],
+                    progressive_ode, ode_ramp_epochs],
             outputs=[train_status],
         )
         stop_btn.click(fn=stop_pretraining, outputs=[train_status])
