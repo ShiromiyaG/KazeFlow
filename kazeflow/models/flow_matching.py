@@ -332,64 +332,6 @@ class ConditionalFlowMatching(nn.Module):
 
         return loss
 
-    def forward_afm(
-        self,
-        x_1: torch.Tensor,
-        x_mask: torch.Tensor,
-        content: torch.Tensor,
-        f0: torch.Tensor,
-        g: Optional[torch.Tensor] = None,
-    ) -> tuple:
-        """
-        Adversarial Flow Matching forward: velocity loss + single-step x₁ prediction.
-
-        Same as forward() but additionally returns:
-          - mel_hat: single-step prediction of x₁ from (x_t, v_t)
-          - t: sampled timesteps (for t²-weighting the adversarial loss)
-
-        mel_hat = x_t + (1 - t) * v_t
-        This is the "denoised" estimate — what the model thinks x₁ is,
-        given the current noisy x_t and its predicted velocity.
-        At high t (close to target), mel_hat is accurate.
-        At low t (close to noise), mel_hat is rough.
-        Weighting by t² ensures the adversarial signal only matters
-        where mel_hat is good enough for the vocoder to decode.
-        """
-        B, C, T = x_1.shape
-
-        B_half = (B + 1) // 2
-        if self.t_sampling == "logit_normal":
-            u = torch.randn(B_half, device=x_1.device, dtype=x_1.dtype)
-            t_half = torch.sigmoid(u * self.t_logit_std + self.t_logit_mean)
-        else:
-            t_half = torch.rand(B_half, device=x_1.device, dtype=x_1.dtype)
-        t = torch.cat([t_half, 1.0 - t_half], dim=0)[:B]
-        t = t.clamp(self.sigma_min, 1.0 - self.sigma_min)
-
-        x_0 = torch.randn_like(x_1)
-        t_expand = t[:, None, None]
-        x_t = (1.0 - (1.0 - self.sigma_min) * t_expand) * x_0 + t_expand * x_1
-        u_t = x_1 - (1.0 - self.sigma_min) * x_0
-
-        g_train = g
-        if g is not None and self.cfg_dropout > 0.0 and self.training:
-            drop_mask = torch.rand(B, device=x_1.device) < self.cfg_dropout
-            if drop_mask.any():
-                g_train = g.clone()
-                g_train[drop_mask] = 0.0
-
-        v_t = self.estimator(x_t, t, content, f0, x_mask, g_train)
-
-        error = (v_t - u_t) * x_mask
-        loss_vel = torch.sqrt(error.square() + 1.0) - 1.0
-        loss_vel = loss_vel.sum() / (x_mask.sum() * C)
-
-        # Single-step prediction of x₁: "what does the model think the
-        # clean mel is, given x_t and v_t?"
-        mel_hat = (x_t + (1.0 - t_expand) * v_t) * x_mask
-
-        return loss_vel, mel_hat, t
-
     def _cfg_velocity(
         self,
         x: torch.Tensor,

@@ -266,7 +266,6 @@ def start_training(
     pretrain_path: str,
     resume_path: str,
     content_embedder: str,
-    architecture: str,
     vocoder_type: str,
     # Advanced
     precision: str,
@@ -277,11 +276,6 @@ def start_training(
     gradient_balancer: bool,
     progressive_ode: bool,
     ode_ramp_epochs: int,
-    # AFM (v2)
-    afm_c_afm: float = 0.1,
-    afm_adv_every: int = 2,
-    afm_ramp_epochs: int = 30,
-    afm_curriculum_epochs: int = 60,
 ):
     """Start training in a background thread."""
     global _training_thread, _training_status
@@ -302,14 +296,20 @@ def start_training(
 
             experiment_dir = Path("logs") / model_name
             existing_cfg = experiment_dir / "config.json"
+            
+            from kazeflow.configs import apply_vocoder_overlay, load_config
+            _vtype = vocoder_type if vocoder_type != "chouwa_gan" else None
 
             if existing_cfg.exists():
                 with open(existing_cfg, "r") as f:
                     config = json.load(f)
                 logger.info(f"Loaded existing config from {existing_cfg}")
+                # Ensure selected vocoder is applied over the base config
+                if _vtype is not None:
+                    config = apply_vocoder_overlay(config, _vtype)
+                else:
+                    config["model"]["vocoder_type"] = "chouwa_gan"
             else:
-                from kazeflow.configs import load_config
-                _vtype = vocoder_type if vocoder_type != "chouwa_gan" else None
                 config = load_config(sample_rate=sample_rate, vocoder_type=_vtype)
 
             # Apply UI overrides
@@ -335,24 +335,7 @@ def start_training(
             config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
 
             import torch
-
-            is_v2 = architecture == "AFM"
-
-            # AFM config (v2 architecture)
-            # If an afm block already exists in the saved config, preserve it.
-            # Only write a new one if there's no existing afm block.
-            if is_v2 and config["train"].get("afm") is None:
-                config["train"]["afm"] = {
-                    "c_afm": float(afm_c_afm),
-                    "adv_every": int(afm_adv_every),
-                    "ramp_epochs": int(afm_ramp_epochs),
-                    "curriculum_epochs": int(afm_curriculum_epochs),
-                }
-
-            if is_v2:
-                from kazeflow.train.trainer_v2 import KazeFlowV2Trainer
-            else:
-                from kazeflow.train.trainer import KazeFlowTrainer
+            from kazeflow.train.trainer import KazeFlowTrainer
 
             filelist_path = experiment_dir / "filelist.txt"
 
@@ -366,18 +349,11 @@ def start_training(
             output_dir = str(experiment_dir)
 
             _training_status = "Initializing trainer..."
-            if is_v2:
-                trainer = KazeFlowV2Trainer(
-                    config=config,
-                    output_dir=output_dir,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
-            else:
-                trainer = KazeFlowTrainer(
-                    config=config,
-                    output_dir=output_dir,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
+            trainer = KazeFlowTrainer(
+                config=config,
+                output_dir=output_dir,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
 
             if pretrain_path and pretrain_path.strip():
                 from kazeflow.train.pretrain import load_pretrain_for_finetune
@@ -440,17 +416,13 @@ def create_training_tab():
                     value=32000,
                     info="Must match between Preprocess and Training.",
                 )
-            architecture = gr.Radio(
-                    label="Architecture",
-                    choices=["CFM", "AFM"],
-                    value="CFM",
-                    info="CFM: Flow Matching. AFM: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
-                )
             vocoder_type = gr.Radio(
                     label="Vocoder",
-                    choices=["chouwa_gan"],
+                    choices=[
+                        ("ChouwaGAN", "chouwa_gan"),
+                    ],
                     value="chouwa_gan",
-                    info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior (8.7M params).",
+                    info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior.",
                 )
 
         # ── 1. Preprocess Audio ──────────────────────────────────────────
@@ -632,40 +604,6 @@ def create_training_tab():
                             info="Epochs to ramp ODE steps.",
                         )
 
-                with gr.Group(visible=True) as afm_group:
-                    gr.Markdown("#### AFM only")
-                    gr.Markdown(
-                        "Adversarial Flow Matching: discriminator signal "
-                        "flows back to the flow model, teaching it to "
-                        "produce mel that sounds real when vocoded.",
-                    )
-                    with gr.Row():
-                        afm_c_afm = gr.Slider(
-                            label="AFM Strength (c_afm)",
-                            minimum=0.0, maximum=1.0, step=0.01, value=0.1,
-                            interactive=True,
-                            info="Weight of adversarial loss on flow. 0=off.",
-                        )
-                        afm_adv_every = gr.Number(
-                            label="AFM Every N batches",
-                            value=2, precision=0, minimum=1,
-                            interactive=True,
-                            info="Run adversarial path every N batches (saves VRAM).",
-                        )
-                    with gr.Row():
-                        afm_ramp_epochs = gr.Number(
-                            label="AFM Ramp (epochs)",
-                            value=30, precision=0, minimum=0,
-                            interactive=False,
-                            info="Ramp c_afm from 0→full over N epochs.",
-                        )
-                        afm_curriculum_epochs = gr.Number(
-                            label="Vocoder Curriculum (epochs)",
-                            value=60, precision=0, minimum=0,
-                            interactive=False,
-                            info="Blend vocoder input: GT mel → CFM mel over N epochs.",
-                        )
-
             with gr.Row():
                 train_btn = gr.Button("▶ Start Training", variant="primary")
                 stop_btn = gr.Button("⏹ Stop", variant="stop")
@@ -707,13 +645,6 @@ def create_training_tab():
             outputs=[reduction_strength],
         )
 
-        # Show/hide AFM group based on architecture
-        architecture.change(
-            fn=lambda arch: gr.update(visible=arch == "AFM"),
-            inputs=[architecture],
-            outputs=[afm_group],
-        )
-
         preprocess_btn.click(
             fn=run_audio_preprocess,
             inputs=[
@@ -735,15 +666,12 @@ def create_training_tab():
             inputs=[model_name, sample_rate,
                     batch_size, save_every, training_epochs,
                     pretrain_ckpt, resume_ckpt, content_embedder,
-                    architecture, vocoder_type,
+                    vocoder_type,
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,
                     gradient_balancer,
-                    progressive_ode, ode_ramp_epochs,
-                    # AFM (v2)
-                    afm_c_afm, afm_adv_every,
-                    afm_ramp_epochs, afm_curriculum_epochs],
+                    progressive_ode, ode_ramp_epochs],
             outputs=[train_status],
         )
         stop_btn.click(fn=stop_training, outputs=[train_status])

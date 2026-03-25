@@ -283,7 +283,6 @@ def start_pretraining(
     cfm_warmup_epochs: int,
     resume_path: str,
     content_embedder: str,
-    architecture: str,
     vocoder_type: str,
     # Advanced
     precision: str,
@@ -311,22 +310,23 @@ def start_pretraining(
         )
         try:
             _pretrain_status = "Loading config..."
-
-            is_v2 = architecture == "AFM"
-            cfg_dir = Path(__file__).parent.parent / "kazeflow" / "configs"
-
             experiment_dir = Path("logs") / model_name
             existing_cfg = experiment_dir / "config.json"
+            
+            from kazeflow.configs import apply_vocoder_overlay, load_config
+            _vtype = vocoder_type if vocoder_type != "chouwa_gan" else None
 
             if existing_cfg.exists():
                 with open(existing_cfg, "r") as f:
                     config = json.load(f)
                 logger.info(f"Loaded existing config from {existing_cfg}")
+                # Ensure selected vocoder is applied over the base config
+                if _vtype is not None:
+                    config = apply_vocoder_overlay(config, _vtype)
+                else:
+                    config["model"]["vocoder_type"] = "chouwa_gan"
             else:
-                from kazeflow.configs import load_config
-                preset = "pretrain_v2" if is_v2 else "pretrain"  # AFM uses pretrain_v2 config
-                _vtype = vocoder_type if vocoder_type != "chouwa_gan" else None
-                config = load_config(sample_rate=sample_rate, preset=preset, vocoder_type=_vtype)
+                config = load_config(sample_rate=sample_rate, preset="pretrain", vocoder_type=_vtype)
 
             # Apply UI overrides
             config["train"]["precision"] = precision
@@ -404,34 +404,19 @@ def start_pretraining(
 
             import torch
 
-            if is_v2:
-                from kazeflow.train.pretrain_v2 import KazeFlowV2Pretrainer
+            from kazeflow.train.pretrain import KazeFlowPretrainer
 
-                _pretrain_status = (
-                    f"Initializing AFM pretrainer "
-                    f"({config['model']['n_speakers']} speakers)..."
-                )
-                output_dir = str(experiment_dir)
+            _pretrain_status = (
+                f"Initializing pretrainer "
+                f"({config['model']['n_speakers']} speakers)..."
+            )
+            output_dir = str(experiment_dir)
 
-                pretrainer = KazeFlowV2Pretrainer(
-                    config=config,
-                    output_dir=output_dir,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
-            else:
-                from kazeflow.train.pretrain import KazeFlowPretrainer
-
-                _pretrain_status = (
-                    f"Initializing pretrainer "
-                    f"({config['model']['n_speakers']} speakers)..."
-                )
-                output_dir = str(experiment_dir)
-
-                pretrainer = KazeFlowPretrainer(
-                    config=config,
-                    output_dir=output_dir,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
+            pretrainer = KazeFlowPretrainer(
+                config=config,
+                output_dir=output_dir,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
 
             resume = resume_path if resume_path and resume_path.strip() else None
 
@@ -493,17 +478,13 @@ def create_pretrain_tab():
                     value=32000,
                     info="Must match between Preprocess and Pretraining.",
                 )
-            architecture = gr.Radio(
-                label="Architecture",
-                choices=["CFM", "AFM"],
-                value="CFM",
-                info="CFM: Flow Matching. AFM: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
-            )
             vocoder_type = gr.Radio(
                 label="Vocoder",
-                choices=["chouwa_gan"],
+                choices=[
+                    ("ChouwaGAN", "chouwa_gan"),
+                ],
                 value="chouwa_gan",
-                info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior (8.7M params).",
+                info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior.",
             )
 
         # ── 1. Preprocess Audio ──────────────────────────────────────────
@@ -760,7 +741,7 @@ def create_pretrain_tab():
             inputs=[model_name, sample_rate,
                     batch_size, save_every, total_epochs,
                     cfm_warmup, resume_ckpt, content_embedder,
-                    architecture, vocoder_type,
+                    vocoder_type,
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,
