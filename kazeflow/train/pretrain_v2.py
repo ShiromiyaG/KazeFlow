@@ -256,6 +256,8 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
 
                 loss_afm = torch.tensor(0.0, device=self.device)
                 _do_afm = False
+                mel_hat_afm = None
+                t_afm = None
 
                 if not in_warmup:
                     # V2: use forward_afm only when AFM is active
@@ -273,8 +275,6 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
                                 x_1=mel, x_mask=x_mask,
                                 content=spin, f0=f0_expanded, g=g,
                             )
-                        mel_hat_afm = None
-                        t_afm = None
                     loss_cfm = loss_vel
 
                     # ── V2: Adversarial path ─────────────────────────
