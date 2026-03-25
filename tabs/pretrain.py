@@ -220,7 +220,7 @@ _STANDARD_PROFILE = {
 # Optimised for GPUs with 40 GB+ VRAM (A100, H100, etc.) and datasets >= 50 h.
 # Key differences vs Standard:
 #   • batch_size 64   — fills HBM bandwidth, 4× more gradient signal per step
-#   • tf32_bf16       — ~2× throughput on Ampere/Hopper tensor cores
+#   • tf32_fp16       — ~2× throughput on Ampere/Hopper tensor cores
 #   • torch.compile   — kernel fusion, ~15–25% extra throughput on A100
 #   • fewer epochs    — 64× batch sees the same # samples in far fewer epochs
 #   • save_every 10   — avoids filling disk with hundreds of 200 MB checkpoints
@@ -232,7 +232,7 @@ _HIGH_THROUGHPUT_PROFILE = {
     "cfm_warmup": 10,
     "ode_ramp_epochs": 75,
     "lr_scheduler": "cosine_warmup_restarts",
-    "precision": "tf32_bf16",
+    "precision": "tf32_fp16",
     "torch_compile": True,
 }
 
@@ -618,7 +618,7 @@ def create_pretrain_tab():
                     )
                     with gr.Row(visible=False) as ht_notes:
                         gr.Markdown(
-                            "> 💡 **High-Throughput** sets **batch 64**, **BF16+TF32 precision**, "
+                            "> 💡 **High-Throughput** sets **batch 64**, **FP16+TF32 precision**, "
                             "**torch.compile** and scales epochs/ramp down accordingly. "
                             "Learning rates are automatically scaled by √(batch/16) ≈ 2×."
                         )
@@ -629,7 +629,7 @@ def create_pretrain_tab():
                         label="Precision",
                         choices=_prec_choices,
                         value=_prec_default,
-                        info="tf32_bf16: recommended for Ampere+ GPUs.",
+                        info="tf32_fp16: recommended for Ampere+ GPUs.",
                     )
                     with gr.Row(visible=_GPU_CAPS["has_compile"]):
                         torch_compile = gr.Checkbox(

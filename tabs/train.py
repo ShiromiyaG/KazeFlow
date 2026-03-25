@@ -552,7 +552,7 @@ def create_training_tab():
                         label="Precision",
                         choices=_prec_choices,
                         value=_prec_default,
-                        info="tf32_bf16: recommended for Ampere+ GPUs.",
+                        info="tf32_fp16: recommended for Ampere+ GPUs.",
                     )
                     with gr.Row(visible=_GPU_CAPS["has_compile"]):
                         torch_compile = gr.Checkbox(

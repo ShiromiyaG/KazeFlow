@@ -51,5 +51,5 @@ def get_precision_choices(caps: dict | None = None) -> tuple[list[str], str]:
     if not filtered:
         filtered = ["fp32"]
 
-    default = "tf32_bf16" if "tf32_bf16" in filtered else filtered[-1]
+    default = "tf32_fp16" if "tf32_fp16" in filtered else filtered[-1]
     return filtered, default
