@@ -374,7 +374,7 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
                     _accum_cfm = 0
 
                 _loss_cfm_val = loss_cfm.item()
-                if _do_afm:
+                if _do_afm and _vel_gate <= 0:
                     del loss_cfm, loss_vel, mel_hat_afm, t_afm
 
                 if in_warmup:
