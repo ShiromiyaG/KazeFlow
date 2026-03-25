@@ -1,9 +1,5 @@
 {
-  "_doc": "Default ChouwaGAN discriminator config (48kHz). MS-STFT + FastMPD + UnivHD.",
-  "stft_configs": [
-    {"n_fft": 2048, "hop_length": 512, "win_length": 2048},
-    {"n_fft": 1024, "hop_length": 256, "win_length": 1024}
-  ],
+  "_doc": "ChouwaGAN discriminator config — SR-independent parameters only. univhd_n_fft/univhd_hop_length are set per-SR in sr/*.json.",
   "stft_channels": 64,
   "stft_max_channels": 128,
   "stft_n_layers": 3,
@@ -14,8 +10,6 @@
   "univhd_n_harmonics": 10,
   "univhd_bins_per_octave": 24,
   "univhd_channels": 64,
-  "univhd_n_fft": 2048,
-  "univhd_hop_length": 512,
   "use_spectral_norm": false,
   "use_san": true
 }

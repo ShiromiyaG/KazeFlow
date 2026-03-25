@@ -205,6 +205,61 @@ def run_pretrain_feature_extraction(
 
 
 # ---------------------------------------------------------------------------
+# Training profiles
+# ---------------------------------------------------------------------------
+
+_STANDARD_PROFILE = {
+    "batch_size": 16,
+    "save_every": 1,
+    "total_epochs": 200,
+    "cfm_warmup": 20,
+    "ode_ramp_epochs": 100,
+    "lr_scheduler": "cosine_warmup_restarts",
+}
+
+# Optimised for GPUs with 40 GB+ VRAM (A100, H100, etc.) and datasets >= 50 h.
+# Key differences vs Standard:
+#   • batch_size 64   — fills HBM bandwidth, 4× more gradient signal per step
+#   • tf32_bf16       — ~2× throughput on Ampere/Hopper tensor cores
+#   • torch.compile   — kernel fusion, ~15–25% extra throughput on A100
+#   • fewer epochs    — 64× batch sees the same # samples in far fewer epochs
+#   • save_every 10   — avoids filling disk with hundreds of 200 MB checkpoints
+_HIGH_THROUGHPUT_PROFILE = {
+    "batch_size": 64,
+    "save_every": 10,
+    "total_epochs": 150,
+    "cfm_warmup": 10,
+    "ode_ramp_epochs": 75,
+    "lr_scheduler": "cosine_warmup_restarts",
+    "precision": "tf32_bf16",
+    "torch_compile": True,
+}
+
+
+def apply_training_profile(profile: str, prec_default: str):
+    """Return gr.update() calls for all schedule/advanced fields from a profile."""
+    if profile == "high_throughput":
+        p = _HIGH_THROUGHPUT_PROFILE
+        prec = p.get("precision", prec_default)
+        compile_val = p.get("torch_compile", False)
+    else:
+        p = _STANDARD_PROFILE
+        prec = prec_default
+        compile_val = False
+
+    return (
+        gr.update(value=p["batch_size"]),
+        gr.update(value=p["save_every"]),
+        gr.update(value=p["total_epochs"]),
+        gr.update(value=p["cfm_warmup"]),
+        gr.update(value=p["ode_ramp_epochs"]),
+        gr.update(value=p["lr_scheduler"]),
+        gr.update(value=prec),
+        gr.update(value=compile_val),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pretraining
 # ---------------------------------------------------------------------------
 
@@ -237,6 +292,7 @@ def start_pretraining(
     gan_loss_type: str,
     progressive_ode: bool,
     ode_ramp_epochs: int,
+    training_profile: str = "standard",
 ):
     """Start pretraining in a background thread."""
     global _pretrain_thread, _pretrain_status
@@ -293,6 +349,23 @@ def start_pretraining(
                 config["train"]["cfm_warmup_epochs"] = int(cfm_warmup_epochs)
             config["train"]["progressive_ode"] = progressive_ode
             config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
+
+            # ── High-Throughput LR scaling ─────────────────────────────
+            # AdamW sqrt-scaling rule: lr *= √(batch_new / batch_base).
+            # Base batch for pretrain is 16; HT uses 64 → factor = √4 = 2.
+            if training_profile == "high_throughput":
+                import math
+                base_bs = _STANDARD_PROFILE["batch_size"]
+                actual_bs = config["train"].get("batch_size", base_bs)
+                lr_scale = math.sqrt(actual_bs / base_bs)
+                for lr_key in ("learning_rate_flow", "learning_rate_vocoder",
+                               "learning_rate_disc"):
+                    old_lr = config["train"].get(lr_key, 0.0002)
+                    config["train"][lr_key] = round(old_lr * lr_scale, 8)
+                logger.info(
+                    f"High-Throughput profile: LRs scaled ×{lr_scale:.2f} "
+                    f"(batch {base_bs}→{actual_bs})"
+                )
 
             filelist_path = experiment_dir / "filelist.txt"
 
@@ -546,6 +619,24 @@ def create_pretrain_tab():
             _prec_choices, _prec_default = get_precision_choices(_GPU_CAPS)
             with gr.Accordion("⚙ Advanced Settings", open=False):
                 with gr.Group():
+                    gr.Markdown("#### Training Profile")
+                    training_profile = gr.Radio(
+                        label="Profile",
+                        choices=[
+                            ("Standard  —  any GPU, datasets < 10 h", "standard"),
+                            ("High-Throughput  —  40 GB+ VRAM (A100/H100), datasets ≥ 50 h, batch 64", "high_throughput"),
+                        ],
+                        value="standard",
+                        info="Select a profile to auto-fill the schedule and advanced settings below. You can still override individual values after selecting.",
+                    )
+                    with gr.Row(visible=False) as ht_notes:
+                        gr.Markdown(
+                            "> 💡 **High-Throughput** sets **batch 64**, **BF16+TF32 precision**, "
+                            "**torch.compile** and scales epochs/ramp down accordingly. "
+                            "Learning rates are automatically scaled by √(batch/16) ≈ 2×."
+                        )
+
+                with gr.Group():
                     gr.Markdown("#### Precision & Compilation")
                     precision = gr.Radio(
                         label="Precision",
@@ -608,6 +699,21 @@ def create_pretrain_tab():
         _clear_if_empty = lambda v: gr.update(value=None) if not v or not v.strip() else gr.update()
         resume_ckpt.change(fn=_clear_if_empty, inputs=[resume_ckpt], outputs=[resume_ckpt])
 
+        # Training profile auto-fill
+        _prec_default_captured = _prec_default  # capture for closure
+        training_profile.change(
+            fn=lambda profile: (
+                *apply_training_profile(profile, _prec_default_captured),
+                gr.update(visible=profile == "high_throughput"),
+            ),
+            inputs=[training_profile],
+            outputs=[
+                batch_size, save_every, total_epochs, cfm_warmup,
+                ode_ramp_epochs, lr_scheduler, precision, torch_compile,
+                ht_notes,
+            ],
+        )
+
         refresh_btn.click(
             fn=refresh_pretrain_lists,
             inputs=[resume_ckpt],
@@ -652,7 +758,8 @@ def create_pretrain_tab():
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,
-                    progressive_ode, ode_ramp_epochs],
+                    progressive_ode, ode_ramp_epochs,
+                    training_profile],
             outputs=[train_status],
         )
         stop_btn.click(fn=stop_pretraining, outputs=[train_status])

@@ -2,10 +2,22 @@
   "model": {
     "sample_rate": 40000,
     "hop_length": 400,
+    "n_fft": 1024,
+    "win_length": 1024,
     "segment_size": 19200,
     "vocoder": {
       "upsample_rates": [8, 5, 5, 2],
-      "upsample_kernel_sizes": [16, 10, 10, 4]
+      "upsample_kernel_sizes": [16, 10, 10, 4],
+      "n_fft": 1024,
+      "win_length": 1024
+    },
+    "discriminator": {
+      "stft_configs": [
+        {"n_fft": 1024, "hop_length": 256, "win_length": 1024},
+        {"n_fft": 512,  "hop_length": 128, "win_length": 512}
+      ],
+      "univhd_n_fft": 1024,
+      "univhd_hop_length": 256
     }
   }
 }
