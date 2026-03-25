@@ -66,9 +66,11 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
         self.curriculum_epochs = afm.get("curriculum_epochs", 100)
 
         # ── AFM stability controls ─────────────────────────────────────
-        self.t_weight_power = afm.get("t_weight_power", 1.0)
+        self.t_weight_power = afm.get("t_weight_power", 2.0)
+        self.c_mel_anchor = afm.get("c_mel_anchor", 1.0)
         self.vel_gate_threshold = afm.get("vel_gate_threshold", 0.5)
         self._vel_loss_ema = None
+        self._vel_loss_ema_clean = None  # EMA only on steps without AFM
         self._vel_loss_ema_decay = afm.get("vel_ema_decay", 0.99)
         self.afm_loss_type = afm.get("loss_type", "gen_loss")
 
@@ -288,44 +290,60 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
                         # Velocity-gated AFM: suppress adversarial signal
                         # when velocity loss is rising.
                         _vel_gate = 1.0
-                        if (self._vel_loss_ema is not None
+                        _gate_ema = self._vel_loss_ema_clean or self._vel_loss_ema
+                        if (_gate_ema is not None
                                 and self.vel_gate_threshold > 0):
-                            _vel_ratio = loss_vel.item() / max(self._vel_loss_ema, 1e-8)
+                            _vel_ratio = loss_vel.item() / max(_gate_ema, 1e-8)
                             _vel_gate = max(0.0, min(1.0,
                                 1.0 - (_vel_ratio - 1.0) / self.vel_gate_threshold))
 
                         if _vel_gate > 0:
                             self._freeze_params(self.vocoder, self.discriminator)
-                            with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                                wav_afm = self.vocoder(mel_hat_afm, f0, g=g)
-                                _afm_len = min(wav_afm.shape[-1], wav_gt.shape[-1])
-                                wav_afm = wav_afm[..., :_afm_len]
-                                _compute_fmaps = self.afm_loss_type != "gen_loss"
-                                y_d_rs_afm, y_d_gs_afm, fmap_rs_afm, fmap_gs_afm = self.discriminator(
-                                    wav_gt[..., :_afm_len].detach(), wav_afm,
-                                    compute_fmaps=_compute_fmaps)
-                                if self.afm_loss_type == "feature_match":
-                                    loss_afm = feature_loss(fmap_rs_afm, fmap_gs_afm)
-                                elif self.afm_loss_type == "both":
-                                    loss_afm = (
-                                        self._gen_loss_fn(y_d_gs_afm)
-                                        + feature_loss(fmap_rs_afm, fmap_gs_afm)
-                                    )
-                                else:  # "gen_loss"
-                                    loss_afm = self._gen_loss_fn(y_d_gs_afm)
+                            self.vocoder.eval()
+                            self.discriminator.eval()
+                            try:
+                                _mel_min = self.config["model"].get("mel_min", -11.5)
+                                _mel_max = self.config["model"].get("mel_max", 2.0)
+                                mel_hat_clamped = mel_hat_afm.clamp(_mel_min, _mel_max)
+                                with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                                    wav_afm = self.vocoder(mel_hat_clamped, f0, g=g)
+                                    _afm_len = min(wav_afm.shape[-1], wav_gt.shape[-1])
+                                    wav_afm = wav_afm[..., :_afm_len]
+                                    _compute_fmaps = self.afm_loss_type != "gen_loss"
+                                    y_d_rs_afm, y_d_gs_afm, fmap_rs_afm, fmap_gs_afm = self.discriminator(
+                                        wav_gt[..., :_afm_len].detach(), wav_afm,
+                                        compute_fmaps=_compute_fmaps)
+                                    if self.afm_loss_type == "feature_match":
+                                        loss_afm = feature_loss(fmap_rs_afm, fmap_gs_afm)
+                                    elif self.afm_loss_type == "both":
+                                        loss_afm = (
+                                            self._gen_loss_fn(y_d_gs_afm)
+                                            + feature_loss(fmap_rs_afm, fmap_gs_afm)
+                                        )
+                                    else:  # "gen_loss"
+                                        loss_afm = self._gen_loss_fn(y_d_gs_afm)
 
-                            # t^alpha weighting (default alpha=1, softer than original t²)
-                            t_weight = (t_afm ** self.t_weight_power).mean()
-                            loss_cfm = loss_cfm + (
-                                _vel_gate * _effective_c_afm * t_weight * loss_afm
-                            )
-
-                            self._unfreeze_params(self.vocoder, self.discriminator)
+                                # t^alpha weighting
+                                t_weight = (t_afm ** self.t_weight_power).mean()
+                                loss_mel_anchor = torch.nn.functional.l1_loss(
+                                    mel_hat_afm * x_mask, mel * x_mask
+                                )
+                                loss_cfm = loss_cfm + (
+                                    _vel_gate * _effective_c_afm * t_weight * loss_afm
+                                ) + (
+                                    _vel_gate * self.c_mel_anchor * t_weight * loss_mel_anchor
+                                )
+                            finally:
+                                self.vocoder.train()
+                                self.discriminator.train()
+                                self._unfreeze_params(self.vocoder, self.discriminator)
 
                         # Log AFM loss immediately (not gated by log_every)
                         _afm_val = loss_afm.item()
                         if self.is_main and math.isfinite(_afm_val):
                             self.writer.add_scalar("loss/afm", _afm_val, self.global_step)
+                            if _vel_gate > 0:
+                                self.writer.add_scalar("loss/mel_anchor", loss_mel_anchor.item(), self.global_step)
                         _afm_loss_accum += _afm_val if math.isfinite(_afm_val) else 0.0
                         _afm_loss_count += 1
 
@@ -339,6 +357,15 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
                                 self._vel_loss_ema_decay * self._vel_loss_ema
                                 + (1.0 - self._vel_loss_ema_decay) * _vel_val
                             )
+                        # Clean EMA: only updated on steps without AFM contamination
+                        if not _do_afm:
+                            if self._vel_loss_ema_clean is None:
+                                self._vel_loss_ema_clean = _vel_val
+                            else:
+                                self._vel_loss_ema_clean = (
+                                    self._vel_loss_ema_decay * self._vel_loss_ema_clean
+                                    + (1.0 - self._vel_loss_ema_decay) * _vel_val
+                                )
                 else:
                     # Warmup: regular v1 CFM forward (no mel_hat needed)
                     with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
@@ -374,17 +401,15 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
                     _accum_cfm = 0
 
                 _loss_cfm_val = loss_cfm.item()
-                if _do_afm and _vel_gate <= 0:
-                    del loss_cfm, loss_vel, mel_hat_afm, t_afm
 
                 if in_warmup:
                     if _do_flow_step:
                         self.scaler_flow.update()
                     self.global_step += 1
-                    pbar.set_postfix(cfm=f"{loss_cfm.item():.4f}")
+                    pbar.set_postfix(cfm=f"{_loss_cfm_val:.4f}")
                     if self.is_main and self.global_step % log_every == 0:
                         step = self.global_step
-                        self.writer.add_scalar("loss/cfm", loss_cfm.item(), step)
+                        self.writer.add_scalar("loss/cfm", _loss_cfm_val, step)
                         self.writer.add_scalar("grad_norm/flow", _gn_flow.item(), step)
                         self.writer.add_scalar("lr/flow", self.optim_flow.param_groups[0]["lr"], step)
                     if stop_event is not None and stop_event.is_set():
@@ -393,39 +418,31 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
 
                 # ── Phase 2: Joint training ──────────────────────────
 
-                # ODE sample mel_hat for vocoder (or reuse AFM mel_hat)
-                _used_afm_mel = False
-                if _do_afm and _vel_gate > 0 and t_afm is not None:
-                    if t_afm.mean().item() > 0.4:
-                        mel_hat = mel_hat_afm.detach()
-                        _used_afm_mel = True
+                # Always use ODE multi-step sampling for vocoder input.
+                # Single-step mel_hat_afm is inferior; ODE gives cleaner mel.
+                if _ode_min_cfg >= _eff_ode_max:
+                    _ode_n = _ode_min_cfg
+                else:
+                    _ode_n = int(round(math.exp(
+                        random.uniform(math.log(_ode_min_cfg), math.log(_eff_ode_max)))))
 
-                if not _used_afm_mel:
-                    if _ode_min_cfg >= _eff_ode_max:
-                        _ode_n = _ode_min_cfg
-                    else:
-                        _ode_n = int(round(math.exp(
-                            random.uniform(math.log(_ode_min_cfg), math.log(_eff_ode_max)))))
-
-                    self.flow.eval()
-                    with torch.no_grad():
-                        mel_hat = self.flow.sample(
-                            content=spin, f0=f0_expanded,
-                            x_mask=x_mask, g=g,
-                            n_steps=_ode_n,
-                            method=train_cfg.get("ode_method_train", "euler"),
-                        )
-                    self.flow.train()
+                self.flow.eval()
+                with torch.no_grad():
+                    mel_hat = self.flow.sample(
+                        content=spin, f0=f0_expanded,
+                        x_mask=x_mask, g=g,
+                        n_steps=_ode_n,
+                        method=train_cfg.get("ode_method_train", "euler"),
+                    )
+                self.flow.train()
 
                 # ── V2 CHANGE: Curriculum vocoder input ──────────────
-                # Smoothly blend GT mel and CFM mel_hat over curriculum.
-                # At start: 100% GT. At end: 100% mel_hat from CFM.
-                # Using linear interpolation instead of binary sampling
-                # to avoid bimodal mel loss spikes.
-                _voc_input_mel = (
-                    (1.0 - _curriculum_progress) * mel.detach()
-                    + _curriculum_progress * mel_hat.detach()
-                )
+                # Binary stochastic selection: each sample in the batch
+                # sees either GT mel or CFM mel_hat based on curriculum
+                # probability. Avoids bimodal blended mels that confuse
+                # the vocoder.
+                _use_hat = torch.rand(B, 1, 1, device=mel.device) < _curriculum_progress
+                _voc_input_mel = torch.where(_use_hat, mel_hat.detach(), mel.detach())
 
                 # Vocoder forward
                 with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
