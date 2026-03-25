@@ -395,7 +395,7 @@ class KazeFlowV2Pretrainer(KazeFlowPretrainer):
 
                 # ODE sample mel_hat for vocoder (or reuse AFM mel_hat)
                 _used_afm_mel = False
-                if _do_afm and _vel_gate > 0:
+                if _do_afm and _vel_gate > 0 and t_afm is not None:
                     if t_afm.mean().item() > 0.4:
                         mel_hat = mel_hat_afm.detach()
                         _used_afm_mel = True
