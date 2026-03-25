@@ -312,7 +312,7 @@ def start_pretraining(
         try:
             _pretrain_status = "Loading config..."
 
-            is_v2 = architecture == "v2"
+            is_v2 = architecture == "AFM"
             cfg_dir = Path(__file__).parent.parent / "kazeflow" / "configs"
 
             experiment_dir = Path("logs") / model_name
@@ -324,7 +324,7 @@ def start_pretraining(
                 logger.info(f"Loaded existing config from {existing_cfg}")
             else:
                 from kazeflow.configs import load_config
-                preset = "pretrain_v2" if is_v2 else "pretrain"
+                preset = "pretrain_v2" if is_v2 else "pretrain"  # AFM uses pretrain_v2 config
                 _vtype = vocoder_type if vocoder_type != "chouwa_gan" else None
                 config = load_config(sample_rate=sample_rate, preset=preset, vocoder_type=_vtype)
 
@@ -408,7 +408,7 @@ def start_pretraining(
                 from kazeflow.train.pretrain_v2 import KazeFlowV2Pretrainer
 
                 _pretrain_status = (
-                    f"Initializing AFM v2 pretrainer "
+                    f"Initializing AFM pretrainer "
                     f"({config['model']['n_speakers']} speakers)..."
                 )
                 output_dir = str(experiment_dir)
@@ -495,9 +495,9 @@ def create_pretrain_tab():
                 )
             architecture = gr.Radio(
                 label="Architecture",
-                choices=["v1", "v2"],
-                value="v2",
-                info="v1: Flow Matching. v2: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
+                choices=["CFM", "AFM"],
+                value="CFM",
+                info="CFM: Flow Matching. AFM: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
             )
             vocoder_type = gr.Radio(
                 label="Vocoder",

@@ -602,7 +602,7 @@ class KazeFlowPretrainer:
 
         if self.is_main:
             _log_section("Start")
-            logger.info(f"Vocoder: {model_cfg.get('vocoder_type', 'chouwa_gan')}")
+            logger.info(f"Vocoder: {self.config['model'].get('vocoder_type', 'chouwa_gan')}")
             logger.info(f"Pretraining for {epochs} epochs ({cfm_warmup} CFM warmup)")
             logger.info(f"Dataset: {len(dataloader.dataset)} samples")
 

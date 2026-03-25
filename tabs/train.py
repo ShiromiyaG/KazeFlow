@@ -336,7 +336,7 @@ def start_training(
 
             import torch
 
-            is_v2 = architecture == "v2"
+            is_v2 = architecture == "AFM"
 
             # AFM config (v2 architecture)
             # If an afm block already exists in the saved config, preserve it.
@@ -442,9 +442,9 @@ def create_training_tab():
                 )
             architecture = gr.Radio(
                     label="Architecture",
-                    choices=["v1", "v2"],
-                    value="v2",
-                    info="v1: Flow Matching. v2: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
+                    choices=["CFM", "AFM"],
+                    value="CFM",
+                    info="CFM: Flow Matching. AFM: Adversarial Flow Matching (adversarial signal to CFM + vocoder curriculum).",
                 )
             vocoder_type = gr.Radio(
                     label="Vocoder",
@@ -633,7 +633,7 @@ def create_training_tab():
                         )
 
                 with gr.Group(visible=True) as afm_group:
-                    gr.Markdown("#### AFM (v2 only)")
+                    gr.Markdown("#### AFM only")
                     gr.Markdown(
                         "Adversarial Flow Matching: discriminator signal "
                         "flows back to the flow model, teaching it to "
@@ -709,7 +709,7 @@ def create_training_tab():
 
         # Show/hide AFM group based on architecture
         architecture.change(
-            fn=lambda arch: gr.update(visible=arch == "v2"),
+            fn=lambda arch: gr.update(visible=arch == "AFM"),
             inputs=[architecture],
             outputs=[afm_group],
         )

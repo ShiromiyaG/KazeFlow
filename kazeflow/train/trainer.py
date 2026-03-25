@@ -537,7 +537,7 @@ class KazeFlowTrainer:
         log_every = train_cfg["log_every"]
 
         _log_section("Start")
-        logger.info(f"Vocoder: {model_cfg.get('vocoder_type', 'chouwa_gan')}")
+        logger.info(f"Vocoder: {self.config['model'].get('vocoder_type', 'chouwa_gan')}")
         logger.info(f"Starting training for {epochs} epochs")
         logger.info(f"Dataset: {len(dataloader.dataset)} samples")
         logger.info(f"Batch size: {train_cfg['batch_size']}")
