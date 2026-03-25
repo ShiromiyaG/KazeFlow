@@ -226,6 +226,7 @@ _STANDARD_PROFILE = {
 #   • save_every 10   — avoids filling disk with hundreds of 200 MB checkpoints
 _HIGH_THROUGHPUT_PROFILE = {
     "batch_size": 64,
+    "num_workers": 8,
     "save_every": 10,
     "total_epochs": 150,
     "cfm_warmup": 10,
@@ -350,10 +351,14 @@ def start_pretraining(
             config["train"]["progressive_ode"] = progressive_ode
             config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
 
-            # ── High-Throughput LR scaling ─────────────────────────────
-            # AdamW sqrt-scaling rule: lr *= √(batch_new / batch_base).
-            # Base batch for pretrain is 16; HT uses 64 → factor = √4 = 2.
+            # ── High-Throughput overrides ──────────────────────────────
             if training_profile == "high_throughput":
+                # num_workers: 8 saturates A100 HBM bandwidth with batch 64
+                # without over-subscribing CPU cores.
+                config["train"]["num_workers"] = _HIGH_THROUGHPUT_PROFILE["num_workers"]
+
+                # AdamW sqrt-scaling rule: lr *= √(batch_new / batch_base).
+                # Base batch for pretrain is 16; HT uses 64 → factor = √4 = 2.
                 import math
                 base_bs = _STANDARD_PROFILE["batch_size"]
                 actual_bs = config["train"].get("batch_size", base_bs)
@@ -363,7 +368,8 @@ def start_pretraining(
                     old_lr = config["train"].get(lr_key, 0.0002)
                     config["train"][lr_key] = round(old_lr * lr_scale, 8)
                 logger.info(
-                    f"High-Throughput profile: LRs scaled ×{lr_scale:.2f} "
+                    f"High-Throughput profile: num_workers={config['train']['num_workers']}, "
+                    f"LRs scaled ×{lr_scale:.2f} "
                     f"(batch {base_bs}→{actual_bs})"
                 )
 
