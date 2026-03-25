@@ -13,6 +13,13 @@ set TORCH_LOGS=
 set TORCHINDUCTOR_DISABLE_PROGRESS=1
 set TORCHDYNAMO_VERBOSE=0
 set TORCHINDUCTOR_VERBOSE=0
+set TRITON_DISABLE_LINE_INFO=1
+
+rem Suppress GCC warnings from Triton JIT compilation (if using MinGW/GCC on Windows)
+set CC=gcc
+set CXX=g++
+set CFLAGS=-w
+set CXXFLAGS=-w
 
 env\python.exe app.py %*
 pause

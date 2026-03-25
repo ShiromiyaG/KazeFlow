@@ -15,8 +15,10 @@ export TORCHDYNAMO_VERBOSE=0
 export TRITON_DISABLE_LINE_INFO=1
 export TORCHINDUCTOR_VERBOSE=0
 # Suppress GCC warnings from Triton JIT compilation
-export CC="gcc -w"
-export CXX="g++ -w"
+export CC="gcc"
+export CXX="g++"
+export CFLAGS="-w"
+export CXXFLAGS="-w"
 
 printf "\033]0;KazeFlow\007"
 clear
