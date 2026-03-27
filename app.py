@@ -62,12 +62,6 @@ _root.handlers.clear()
 _root.addHandler(_handler)
 _root.setLevel(logging.INFO)
 
-# Ensure SPIN v2, RMVPE, and SmartCutter weights are present before launching.
-check_and_download_prerequisites()
-
-# Ensure mute reference files exist (no-op if already generated).
-generate_mutes()
-
 
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "images", "logo.png")
 
@@ -232,6 +226,12 @@ def create_app():
 
 
 if __name__ == "__main__":
+    # Ensure SPIN v2, RMVPE, and SmartCutter weights are present before launching.
+    check_and_download_prerequisites()
+
+    # Ensure mute reference files exist (no-op if already generated).
+    generate_mutes()
+
     _share = "--share" in sys.argv
     app = create_app()
     app.launch(

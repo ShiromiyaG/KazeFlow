@@ -10,6 +10,8 @@ set "MINICONDA_DIR=%UserProfile%\Miniconda3"
 set "ENV_DIR=%INSTALL_DIR%\env"
 set "MINICONDA_URL=https://repo.anaconda.com/miniconda/Miniconda3-py310_24.7.1-0-Windows-x86_64.exe"
 set "CONDA_EXE=%MINICONDA_DIR%\Scripts\conda.exe"
+set "FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+set "FFMPEG_DLL_DIR=%ENV_DIR%\Library\bin"
 
 set "startTime=%TIME%"
 set "startHour=%TIME:~0,2%"
@@ -22,6 +24,7 @@ set /a startTotal = startHour*3600 + startMin*60 + startSec
 
 call :install_miniconda
 call :create_conda_env
+call :install_ffmpeg
 call :install_dependencies
 
 set "endTime=%TIME%"
@@ -78,6 +81,11 @@ if errorlevel 1 goto :error
 echo Conda environment created.
 echo.
 
+echo Reinstalling xz to ensure liblzma.dll is present...
+call "%MINICONDA_DIR%\_conda.exe" install --prefix "%ENV_DIR%" -c conda-forge xz --force-reinstall -y
+if errorlevel 1 goto :error
+echo.
+
 if exist "%ENV_DIR%\python.exe" (
     echo Installing uv package installer...
     "%ENV_DIR%\python.exe" -m pip install uv
@@ -89,14 +97,18 @@ exit /b 0
 
 :install_dependencies
 echo Installing dependencies...
-call "%MINICONDA_DIR%\condabin\conda.bat" activate "%ENV_DIR%" || goto :error
+set "UV=%ENV_DIR%\Scripts\uv.exe"
+set "PY=%ENV_DIR%\python.exe"
 
-echo Installing packages with uv...
-uv pip install --upgrade setuptools || goto :error
-uv pip install torch torchaudio --upgrade --index-url https://download.pytorch.org/whl/cu128 || goto :error
-uv pip install -r "%INSTALL_DIR%\requirements.txt" || goto :error
+echo Installing uv...
+"%PY%" -m pip install uv || goto :error
 
-call "%MINICONDA_DIR%\condabin\conda.bat" deactivate
+echo Installing PyTorch with CUDA support...
+"%UV%" pip install --python "%PY%" torch torchaudio --index-url https://download.pytorch.org/whl/cu128 || goto :error
+
+echo Installing remaining dependencies...
+"%UV%" pip install --python "%PY%" -r "%INSTALL_DIR%\requirements.txt" || goto :error
+
 echo Dependencies installed.
 echo.
 exit /b 0

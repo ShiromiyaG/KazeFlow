@@ -7,6 +7,9 @@ if not exist env (
     exit /b 1
 )
 
+rem Add FFmpeg DLLs to PATH so torchcodec can find them
+set "PATH=%~dp0env\Library\bin;%PATH%"
+
 rem Suppress PyTorch compile / Triton / inductor noise
 set PYTHONWARNINGS=ignore
 set TORCH_LOGS=

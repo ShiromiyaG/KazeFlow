@@ -1,7 +1,7 @@
-torch>=2.1.0
-torchaudio>=2.1.0
+# torch and torchaudio are installed separately by the install script
+# with --index-url https://download.pytorch.org/whl/cu128
 gradio>=4.0.0
-numpy
+numpy==1.26
 transformers
 tensorboard
 librosa
@@ -12,3 +12,9 @@ torchcodec
 matplotlib
 triton==3.6.0; sys_platform == "linux"
 triton-windows==3.6.0.post26; sys_platform == "win32"
+ffmpeg-python
+fsspec
+filelock
+typing_extensions
+markupsafe
+jinja2

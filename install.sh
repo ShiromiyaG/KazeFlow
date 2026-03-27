@@ -51,30 +51,46 @@ create_conda_env() {
     fi
 }
 
+install_ffmpeg() {
+    local FFMPEG_DLL_DIR="$ENV_DIR/lib"
+    if [ -f "$FFMPEG_DLL_DIR/libavcodec.so.61" ] || [ -f "$FFMPEG_DLL_DIR/libavcodec.so" ]; then
+        log_message "FFmpeg already present. Skipping."
+        return
+    fi
+
+    log_message "Installing FFmpeg via system package manager..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get install -y ffmpeg
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y ffmpeg
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm ffmpeg
+    else
+        log_message "WARNING: Could not install FFmpeg automatically. Please install it manually."
+    fi
+}
+
 install_dependencies() {
     log_message "Installing dependencies..."
 
-    # shellcheck disable=SC1091
-    source "$MINICONDA_DIR/etc/profile.d/conda.sh"
-    conda activate "$ENV_DIR"
+    local UV="$ENV_DIR/bin/uv"
+    local PY="$ENV_DIR/bin/python"
 
-    export UV_PYTHON="$ENV_DIR/bin/python"
+    log_message "Installing uv..."
+    "$PY" -m pip install uv
 
-    "$ENV_DIR/bin/python" -m pip install --upgrade pip setuptools
-    "$ENV_DIR/bin/python" -m pip install uv
+    log_message "Installing PyTorch with CUDA support..."
+    "$UV" pip install --python "$PY" torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-    "$ENV_DIR/bin/uv" pip install --upgrade setuptools
-    "$ENV_DIR/bin/uv" pip install torch torchaudio --upgrade --index-url https://download.pytorch.org/whl/cu128
-    "$ENV_DIR/bin/uv" pip install -r "$INSTALL_DIR/requirements.txt"
-
-    unset UV_PYTHON
-    conda deactivate
+    log_message "Installing remaining dependencies..."
+    "$UV" pip install --python "$PY" -r "$INSTALL_DIR/requirements.txt"
 
     log_message "Dependencies installed."
 }
 
 install_miniconda
 create_conda_env
+install_ffmpeg
 install_dependencies
 
 elapsed=$SECONDS
