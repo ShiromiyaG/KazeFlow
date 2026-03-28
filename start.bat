@@ -7,6 +7,9 @@ if not exist env (
     exit /b 1
 )
 
+rem Force UTF-8 for Python I/O — prevents UnicodeEncodeError in torch.compile generated code
+set PYTHONUTF8=1
+
 rem Add FFmpeg DLLs and MinGW gcc to PATH so torchcodec and Triton can find them
 set "PATH=%~dp0env\Library\bin;%PATH%"
 
