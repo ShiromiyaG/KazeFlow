@@ -9,7 +9,6 @@
     "save_every": 25,
     "log_every": 50,
     "precision": "fp16",
-    "progressive_ode": false,
     "gt_mel_ratio": 0.5,
     "cfm_warmup_epochs": 50
   }

@@ -448,14 +448,21 @@ class KazeFlowTrainer:
 
 
 
-    def _eval_infer(self, mel_ref, spin_ref, f0_ref, spk_id_ref):
+    def _eval_infer(self, mel_ref, spin_ref, f0_ref, spk_id_ref,
+                     ode_steps_override=None):
         """
         Run the full generation pipeline in eval mode on a reference sample.
         Uses EMA vocoder for higher-quality inference.
 
+        Args:
+            ode_steps_override: If set, use this number of ODE steps instead
+                of the inference config default. Useful for evaluating with
+                the current progressive ODE step count during training.
+
         Returns:
             mel_hat: (1, n_mels, T) generated mel-spectrogram
             wav_hat: (1, 1, T_audio) generated waveform
+            ode_steps_used: number of ODE steps used for this eval
         """
         ema_flow = self.ema_flow.get_model()
         ema_voc = self.ema_vocoder.get_model()
@@ -468,17 +475,19 @@ class KazeFlowTrainer:
             f0_expanded = f0_ref.unsqueeze(1)  # (B, 1, T)
 
             infer_cfg = self.config.get("inference", {})
+            ode_steps = ode_steps_override or infer_cfg.get(
+                "ode_steps", self.config["train"].get("ode_steps_infer", 4))
             mel_hat = ema_flow.sample(
                 content=spin_ref,
                 f0=f0_expanded,
                 x_mask=x_mask,
                 g=g,
-                n_steps=infer_cfg.get("ode_steps", self.config["train"].get("ode_steps_infer", 4)),
+                n_steps=ode_steps,
                 method=infer_cfg.get("ode_method", "midpoint"),
             )
 
             wav_hat = ema_voc(mel_hat, f0_ref, g=g)
-        return mel_hat, wav_hat
+        return mel_hat, wav_hat, ode_steps
 
     def _get_reference_sample(self, dataloader):
         """Get the first batch sample as reference for eval inference."""
@@ -564,18 +573,18 @@ class KazeFlowTrainer:
             _accum_cfm = 0
             _gn_flow = torch.tensor(0.0)
 
-            # Progressive ODE: precompute effective max for this epoch
-            import math as _math
+            # ODE step schedule: stratified sampling for balanced coverage.
+            # Each step count in [min, max] appears the same number of times
+            # per epoch (shuffled), so the vocoder trains equally on all
+            # quality levels and every ODE step count works well at inference.
             import random as _random
-            _ode_min_cfg = train_cfg.get("ode_steps_train_min", train_cfg.get("ode_steps_train", 1))
-            _ode_max_cfg = train_cfg.get("ode_steps_train_max", train_cfg.get("ode_steps_train", 1))
-            if train_cfg.get("progressive_ode", False) and _ode_min_cfg < _ode_max_cfg:
-                _ramp = train_cfg.get("ode_ramp_epochs", epochs)
-                _progress = min(1.0, max(0.0, epoch / max(1, _ramp)))
-                _eff_ode_max = max(_ode_min_cfg, int(round(
-                    _ode_min_cfg + (_ode_max_cfg - _ode_min_cfg) * _progress)))
-            else:
-                _eff_ode_max = _ode_max_cfg
+            _ode_min_cfg = train_cfg.get("ode_steps_train_min", train_cfg.get("ode_steps_train", 2))
+            _ode_max_cfg = train_cfg.get("ode_steps_train_max", train_cfg.get("ode_steps_train", 2))
+            _eff_ode_max = _ode_max_cfg
+            _n_batches = len(dataloader)
+            _step_pool = list(range(_ode_min_cfg, _ode_max_cfg + 1))
+            _ode_schedule = (_step_pool * ((_n_batches // len(_step_pool)) + 1))[:_n_batches]
+            _random.shuffle(_ode_schedule)
 
             for batch_idx, batch in enumerate(pbar):
                 mel, spin, f0, spk_ids, wav_gt = [x.to(self.device) for x in batch]
@@ -622,14 +631,9 @@ class KazeFlowTrainer:
                     _accum_cfm = 0
 
                 # ── Step 2: Generate mel from flow (for vocoder) ─────
-                # ODE step count — log-uniform within [ode_min, eff_max]
+                # ODE step count — stratified: pick from pre-shuffled schedule
                 _train_cfg = self.config["train"]
-                if _ode_min_cfg >= _eff_ode_max:
-                    _ode_n = _ode_min_cfg
-                else:
-                    _ode_n = int(round(_math.exp(
-                        _random.uniform(_math.log(_ode_min_cfg), _math.log(_eff_ode_max))
-                    )))
+                _ode_n = _ode_schedule[batch_idx % len(_ode_schedule)]
                 self.flow.eval()
                 with torch.no_grad():
                     mel_hat = self.flow.sample(
@@ -829,6 +833,8 @@ class KazeFlowTrainer:
                     # LeCam regularization
                     if self.lecam is not None:
                         self.writer.add_scalar("loss/lecam", loss_lecam.item(), step)
+                    # ODE step count used for this batch
+                    self.writer.add_scalar("train/ode_steps", _ode_n, step)
                     # Gradient balancer EMA norms
                     if self.gradient_balancer is not None and self.gradient_balancer._initialized:
                         for name, ema_norm in self.gradient_balancer._ema_norms.items():
@@ -852,8 +858,9 @@ class KazeFlowTrainer:
                 # ── Eval inference → TensorBoard ─────────────────────
                 try:
                     ref_mel, ref_spin, ref_f0, ref_spk = self._get_reference_sample(dataloader)
-                    mel_hat_eval, wav_hat_eval = self._eval_infer(
+                    mel_hat_eval, wav_hat_eval, _eval_ode = self._eval_infer(
                         ref_mel, ref_spin, ref_f0, ref_spk,
+                        ode_steps_override=_eff_ode_max,
                     )
 
                     mel_orig_np = ref_mel[0].detach().cpu().float().numpy()
@@ -893,11 +900,14 @@ class KazeFlowTrainer:
                         sample_rate=self.sample_rate,
                     )
 
+                    self.writer.add_scalar(
+                        "eval/ode_steps", _eval_ode, self.global_step)
                     self.writer.flush()
 
                     logger.info(
                         f"Eval inference logged at epoch {epoch+1}, "
-                        f"step {self.global_step}"
+                        f"step {self.global_step} "
+                        f"(ODE steps: {_eval_ode})"
                     )
                 except Exception as e:
                     logger.warning(f"Eval inference failed: {e}")

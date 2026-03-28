@@ -1,6 +1,7 @@
 """KazeFlow UI tabs — shared helpers."""
 
 import logging
+import sys
 
 logger = logging.getLogger("kazeflow.ui")
 
@@ -30,6 +31,10 @@ def _gpu_caps() -> dict:
             has_compile = hasattr(torch, "compile")
     except Exception:
         logger.debug("GPU capability detection failed", exc_info=True)
+
+    # Triton (torch.compile backend) is not supported on Windows
+    if sys.platform == "win32":
+        has_compile = False
 
     return {"has_tf32": has_tf32, "has_bf16": has_bf16, "has_compile": has_compile}
 

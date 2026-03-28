@@ -213,7 +213,6 @@ _STANDARD_PROFILE = {
     "save_every": 1,
     "total_epochs": 200,
     "cfm_warmup": 20,
-    "ode_ramp_epochs": 100,
     "lr_scheduler": "cosine_warmup_restarts",
 }
 
@@ -230,7 +229,6 @@ _HIGH_THROUGHPUT_PROFILE = {
     "save_every": 10,
     "total_epochs": 150,
     "cfm_warmup": 10,
-    "ode_ramp_epochs": 75,
     "lr_scheduler": "cosine_warmup_restarts",
     "precision": "tf32_fp16",
     "torch_compile": True,
@@ -253,7 +251,6 @@ def apply_training_profile(profile: str, prec_default: str):
         gr.update(value=p["save_every"]),
         gr.update(value=p["total_epochs"]),
         gr.update(value=p["cfm_warmup"]),
-        gr.update(value=p["ode_ramp_epochs"]),
         gr.update(value=p["lr_scheduler"]),
         gr.update(value=prec),
         gr.update(value=compile_val),
@@ -290,8 +287,6 @@ def start_pretraining(
     compile_mode: str,
     lr_scheduler: str,
     gan_loss_type: str,
-    progressive_ode: bool,
-    ode_ramp_epochs: int,
     training_profile: str = "standard",
 ):
     """Start pretraining in a background thread."""
@@ -348,8 +343,6 @@ def start_pretraining(
 
             if cfm_warmup_epochs >= 0:
                 config["train"]["cfm_warmup_epochs"] = int(cfm_warmup_epochs)
-            config["train"]["progressive_ode"] = progressive_ode
-            config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
 
             # ── High-Throughput overrides ──────────────────────────────
             if training_profile == "high_throughput":
@@ -663,19 +656,6 @@ def create_pretrain_tab():
                             info="soft_hinge: recommended (softplus disc for SAN).",
                         )
 
-                with gr.Group():
-                    gr.Markdown("#### Warmup & Ramp")
-                    with gr.Row():
-                        progressive_ode = gr.Checkbox(
-                            label="Progressive ODE", value=True,
-                            info="Ramp ODE steps from min→max over ode_ramp_epochs.",
-                        )
-                        ode_ramp_epochs = gr.Number(
-                            label="ODE Ramp (epochs)", value=100, precision=0,
-                            minimum=0,
-                            info="Epochs to ramp ODE steps.",
-                        )
-
             with gr.Row():
                 train_btn = gr.Button("▶ Start Pretraining", variant="primary")
                 stop_btn = gr.Button("⏹ Stop", variant="stop")
@@ -696,7 +676,7 @@ def create_pretrain_tab():
             inputs=[training_profile],
             outputs=[
                 batch_size, save_every, total_epochs, cfm_warmup,
-                ode_ramp_epochs, lr_scheduler, precision, torch_compile,
+                lr_scheduler, precision, torch_compile,
                 ht_notes,
             ],
         )
@@ -745,7 +725,6 @@ def create_pretrain_tab():
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,
-                    progressive_ode, ode_ramp_epochs,
                     training_profile],
             outputs=[train_status],
         )

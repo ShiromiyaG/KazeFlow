@@ -274,8 +274,6 @@ def start_training(
     lr_scheduler: str,
     gan_loss_type: str,
     gradient_balancer: bool,
-    progressive_ode: bool,
-    ode_ramp_epochs: int,
 ):
     """Start training in a background thread."""
     global _training_thread, _training_status
@@ -330,9 +328,6 @@ def start_training(
                 config["train"]["save_every"] = save_every
             if epochs > 0:
                 config["train"]["epochs"] = epochs
-
-            config["train"]["progressive_ode"] = progressive_ode
-            config["train"]["ode_ramp_epochs"] = int(ode_ramp_epochs)
 
             import torch
             from kazeflow.train.trainer import KazeFlowTrainer
@@ -591,19 +586,6 @@ def create_training_tab():
                         info="Auto-balance mel/GAN gradient magnitudes (prevents GAN from dominating mel/STFT).",
                     )
 
-                with gr.Group():
-                    gr.Markdown("#### Warmup & Ramp")
-                    with gr.Row():
-                        progressive_ode = gr.Checkbox(
-                            label="Progressive ODE", value=True,
-                            info="Ramp ODE steps from min→max over ode_ramp_epochs.",
-                        )
-                        ode_ramp_epochs = gr.Number(
-                            label="ODE Ramp (epochs)", value=200, precision=0,
-                            minimum=0,
-                            info="Epochs to ramp ODE steps.",
-                        )
-
             with gr.Row():
                 train_btn = gr.Button("▶ Start Training", variant="primary")
                 stop_btn = gr.Button("⏹ Stop", variant="stop")
@@ -671,7 +653,7 @@ def create_training_tab():
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,
                     gradient_balancer,
-                    progressive_ode, ode_ramp_epochs],
+                    ],
             outputs=[train_status],
         )
         stop_btn.click(fn=stop_training, outputs=[train_status])

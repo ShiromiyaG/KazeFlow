@@ -243,7 +243,7 @@ def create_inference_tab():
                 gr.Markdown("### Settings")
                 ode_steps = gr.Slider(
                     label="ODE Steps",
-                    minimum=1, maximum=64, step=1, value=16,
+                    minimum=2, maximum=64, step=1, value=16,
                     info="More steps = higher quality, slower.",
                 )
 

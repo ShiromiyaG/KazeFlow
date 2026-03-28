@@ -159,10 +159,8 @@
     "precision": "fp32",
     "torch_compile": false,
     "compile_mode": "default",
-    "ode_steps_train_min": 1,
+    "ode_steps_train_min": 2,
     "ode_steps_train_max": 16,
-    "progressive_ode": true,
-    "ode_ramp_epochs": 200,
     "gt_mel_ratio": 0.0,
     "n_disc_steps": 1
   },
