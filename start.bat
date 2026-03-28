@@ -7,7 +7,7 @@ if not exist env (
     exit /b 1
 )
 
-rem Add FFmpeg DLLs to PATH so torchcodec can find them
+rem Add FFmpeg DLLs and MinGW gcc to PATH so torchcodec and Triton can find them
 set "PATH=%~dp0env\Library\bin;%PATH%"
 
 rem Suppress PyTorch compile / Triton / inductor noise
@@ -18,11 +18,9 @@ set TORCHDYNAMO_VERBOSE=0
 set TORCHINDUCTOR_VERBOSE=0
 set TRITON_DISABLE_LINE_INFO=1
 
-rem Suppress GCC warnings from Triton JIT compilation (if using MinGW/GCC on Windows)
-set CC=gcc
-set CXX=g++
+rem Point Triton to the MinGW gcc in our env
+set CC=%~dp0env\Library\bin\gcc.exe
 set CFLAGS=-w
-set CXXFLAGS=-w
 
 env\python.exe app.py %*
 pause

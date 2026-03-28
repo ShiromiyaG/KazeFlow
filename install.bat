@@ -100,6 +100,14 @@ echo Installing dependencies...
 set "UV=%ENV_DIR%\Scripts\uv.exe"
 set "PY=%ENV_DIR%\python.exe"
 
+echo Installing conda packages...
+call "%MINICONDA_DIR%\_conda.exe" install --prefix "%ENV_DIR%" -c conda-forge m2w64-gcc -y || goto :error
+
+echo Creating gcc.exe alias for Triton...
+copy /y "%ENV_DIR%\Library\bin\x86_64-w64-mingw32-gcc.exe" "%ENV_DIR%\Library\bin\gcc.exe" >nul
+copy /y "%ENV_DIR%\Library\bin\x86_64-w64-mingw32-g++.exe" "%ENV_DIR%\Library\bin\g++.exe" >nul 2>&1
+echo.
+
 echo Installing uv...
 "%PY%" -m pip install uv || goto :error
 
