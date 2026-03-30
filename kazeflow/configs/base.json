@@ -1,5 +1,6 @@
 {
   "model": {
+    "architecture": "cfm",
     "sample_rate": 48000,
     "hop_length": 480,
     "n_fft": 2048,
@@ -99,7 +100,13 @@
       "use_san": true
     },
     "speaker_embed_dim": 256,
-    "n_speakers": 1
+    "n_speakers": 1,
+    "mel_discriminator": {
+      "n_scales": 5,
+      "channels": 64,
+      "max_channels": 256,
+      "n_layers": 4
+    }
   },
   "train": {
     "batch_size": 8,

@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
-from kazeflow.models.flow_matching import ConditionalFlowMatching
+from kazeflow.models import build_mel_model
 from kazeflow.models.vocoder import build_vocoder
 from kazeflow.infer.index import load_index, retrieve_and_blend
 
@@ -95,8 +95,9 @@ class KazeFlowPipeline:
         model_cfg = self.config["model"]
 
         # Build models
-        self.flow = ConditionalFlowMatching(
-            **model_cfg["flow_matching"]
+        self.architecture = model_cfg.get("architecture", "cfm")
+        self.flow = build_mel_model(
+            self.architecture, **model_cfg["flow_matching"]
         ).to(self.device).eval()
 
         vocoder_type = model_cfg.get("vocoder_type", "chouwa_gan")
@@ -451,18 +452,28 @@ class KazeFlowPipeline:
         # Mask
         x_mask = torch.ones(1, 1, min_len, device=self.device)
 
-        # Flow matching: generate mel from content + f0 + speaker
-        # NOTE: ODE solver MUST run in float32 — float16 accumulates
-        # catastrophic error over multiple integration steps.
-        mel_hat = self.flow.sample(
-            content=spin_features,
-            f0=f0,
-            x_mask=x_mask,
-            g=g,
-            n_steps=ode_steps,
-            method=ode_method,
-            guidance_scale=guidance_scale,
-        )
+        # Generate mel from conditioning
+        if self.architecture == "direct_mel":
+            # Direct mel regression: single deterministic forward pass
+            mel_hat = self.flow.sample(
+                content=spin_features,
+                f0=f0,
+                x_mask=x_mask,
+                g=g,
+            )
+        else:
+            # Flow matching: ODE solver
+            # NOTE: ODE solver MUST run in float32 — float16 accumulates
+            # catastrophic error over multiple integration steps.
+            mel_hat = self.flow.sample(
+                content=spin_features,
+                f0=f0,
+                x_mask=x_mask,
+                g=g,
+                n_steps=ode_steps,
+                method=ode_method,
+                guidance_scale=guidance_scale,
+            )
 
         # Free flow intermediates before vocoder
         del spin_features, x_mask

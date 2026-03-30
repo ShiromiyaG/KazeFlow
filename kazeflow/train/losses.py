@@ -474,6 +474,38 @@ def phase_continuity_loss(
 
 
 # ---------------------------------------------------------------------------
+# Mel Spectral Convergence Loss (operates on mel spectrograms directly)
+# ---------------------------------------------------------------------------
+
+@torch.amp.autocast("cuda", enabled=False)
+def mel_spectral_convergence_loss(
+    mel_real: torch.Tensor,
+    mel_hat: torch.Tensor,
+    x_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Spectral convergence loss on mel spectrograms.
+
+    Frobenius-norm ratio: ||mel_real - mel_hat||_F / ||mel_real||_F
+
+    Complements L1: while L1 penalises absolute error uniformly,
+    spectral convergence penalises relative error — regions with high
+    energy (formants, harmonics) must be reproduced proportionally.
+    Very cheap (~5 ops, no STFT), works directly on mel predictions.
+
+    Args:
+        mel_real: (B, n_mels, T) ground truth mel
+        mel_hat:  (B, n_mels, T) predicted mel
+        x_mask:   (B, 1, T) length mask
+    Returns:
+        Scalar loss
+    """
+    mel_real = mel_real.float()
+    mel_hat = mel_hat.float()
+    diff = (mel_real - mel_hat) * x_mask
+    return torch.norm(diff, p="fro") / (torch.norm(mel_real * x_mask, p="fro") + _EPS)
+
+
+# ---------------------------------------------------------------------------
 # Gradient Balancer (EnCodec-style)
 # ---------------------------------------------------------------------------
 

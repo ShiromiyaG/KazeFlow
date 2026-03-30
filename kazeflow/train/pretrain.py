@@ -37,7 +37,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from kazeflow.models.flow_matching import ConditionalFlowMatching
+from kazeflow.models import build_mel_model
+from kazeflow.models.mel_discriminator import MultiScaleMelDiscriminator
 from kazeflow.models.vocoder import build_vocoder, EMAGenerator
 from kazeflow.models.discriminator import build_discriminator
 from kazeflow.train.dataset import create_dataloader
@@ -51,6 +52,7 @@ from kazeflow.train.losses import (
     generator_loss_hinge,
     generator_loss_soft_hinge,
     mel_spectrogram_loss,
+    mel_spectral_convergence_loss,
     multi_resolution_stft_loss,
     r1_gradient_penalty,
 )
@@ -178,8 +180,9 @@ class KazeFlowPretrainer:
             logger.info("float32 matmul precision set to 'high' (TF32, Ampere+)")
 
         # ── Models ───────────────────────────────────────────────────────
-        self.flow = ConditionalFlowMatching(
-            **model_cfg["flow_matching"]
+        self.architecture = model_cfg.get("architecture", "cfm")
+        self.flow = build_mel_model(
+            self.architecture, **model_cfg["flow_matching"]
         ).to(self.device)
 
         vocoder_type = model_cfg.get("vocoder_type", "chouwa_gan")
@@ -195,6 +198,14 @@ class KazeFlowPretrainer:
             sample_rate=model_cfg["sample_rate"],
             **model_cfg["discriminator"],
         ).to(self.device)
+
+        # Mel discriminator for direct_mel adversarial training
+        if self.architecture == "direct_mel":
+            _mel_disc_cfg = model_cfg.get("mel_discriminator", {})
+            self.mel_disc = MultiScaleMelDiscriminator(**_mel_disc_cfg).to(self.device)
+            logger.info(f"Mel discriminator enabled (direct_mel architecture)")
+        else:
+            self.mel_disc = None
 
         n_speakers = model_cfg.get("n_speakers", 1)
         spk_dim = model_cfg.get("speaker_embed_dim", 256)
@@ -242,6 +253,8 @@ class KazeFlowPretrainer:
             self.vocoder = DDP(self.vocoder, device_ids=[rank])
             self.discriminator = DDP(self.discriminator, device_ids=[rank])
             self.speaker_embed = DDP(self.speaker_embed, device_ids=[rank])
+            if self.mel_disc is not None:
+                self.mel_disc = DDP(self.mel_disc, device_ids=[rank])
 
         # ── Optimizers ───────────────────────────────────────────────────
         lr_flow = train_cfg["learning_rate_flow"]
@@ -308,6 +321,16 @@ class KazeFlowPretrainer:
                 {"params": disc_conv_post, "weight_decay": 0.0},
             ], lr=lr_disc, betas=betas_disc)
 
+        # Mel discriminator optimizer (only for direct_mel)
+        if self.mel_disc is not None:
+            lr_mel_disc = train_cfg.get("learning_rate_mel_disc", lr_disc)
+            self.optim_mel_disc = _make_adamw(
+                self.mel_disc.parameters(),
+                lr=lr_mel_disc, betas=betas_disc, weight_decay=wd,
+            )
+        else:
+            self.optim_mel_disc = None
+
         # ── Schedulers ───────────────────────────────────────────────────
         _log_section("Training")
         lr_decay = train_cfg.get("lr_decay", 0.9999)
@@ -353,6 +376,11 @@ class KazeFlowPretrainer:
             self.optim_vocoder, _total_epochs - _cfm_wu)
         self.sched_disc = _make_sched(
             self.optim_disc, _total_epochs - _cfm_wu, is_disc=True)
+        if self.optim_mel_disc is not None:
+            self.sched_mel_disc = _make_sched(
+                self.optim_mel_disc, _total_epochs, is_disc=True)
+        else:
+            self.sched_mel_disc = None
         if _lr_sched_type == "cosine":
             _sched_info = f" (eta_min_ratio={_eta_min_ratio})"
         elif _lr_sched_type == "cosine_warmup_restarts":
@@ -372,6 +400,8 @@ class KazeFlowPretrainer:
         self.scaler_flow = torch.amp.GradScaler('cuda', enabled=self._needs_scaler)
         self.scaler_gen = torch.amp.GradScaler('cuda', enabled=self._needs_scaler)
         self.scaler_disc = torch.amp.GradScaler('cuda', enabled=self._needs_scaler)
+        if self.mel_disc is not None:
+            self.scaler_mel_disc = torch.amp.GradScaler('cuda', enabled=self._needs_scaler)
 
         if self.is_main:
             self.writer = SummaryWriter(log_dir=str(self.output_dir / "logs"), max_queue=1)
@@ -391,6 +421,11 @@ class KazeFlowPretrainer:
         self.c_r1 = train_cfg.get("c_r1", 0.0)
         self.r1_interval = train_cfg.get("r1_interval", 4)
         self.n_disc_steps = max(1, int(train_cfg.get("n_disc_steps", 1)))
+
+        # Mel adversarial loss weights (only used with direct_mel + mel_disc)
+        self.c_mel_adv = train_cfg.get("c_mel_adv", 1.0)
+        self.c_mel_fm = train_cfg.get("c_mel_fm", 2.0)
+        self.c_mel_sc = train_cfg.get("c_mel_sc", 1.0)
 
         # GAN loss type: "hinge" | "soft_hinge" | "lsgan"
         #   hinge:      disc=hinge_margin, gen=hinge_linear  (BigVGAN style)
@@ -417,6 +452,11 @@ class KazeFlowPretrainer:
         else:
             self._disc_loss_fn = discriminator_loss_lsgan
             self._gen_loss_fn = generator_loss_lsgan
+
+        # Mel disc uses weight_norm (no SAN) — hinge loss is appropriate
+        if self.mel_disc is not None:
+            self._mel_disc_loss_fn = discriminator_loss_hinge
+            self._mel_gen_loss_fn = generator_loss_hinge
 
         logger.info(
             f"GAN loss: {_gan_type}"
@@ -489,16 +529,23 @@ class KazeFlowPretrainer:
             f0_expanded = f0_ref.unsqueeze(1)
 
             infer_cfg = self.config.get("inference", {})
-            ode_steps = ode_steps_override or infer_cfg.get(
-                "ode_steps", self.config["train"].get("ode_steps_infer", 4))
-            mel_hat = ema_flow.sample(
-                content=spin_ref,
-                f0=f0_expanded,
-                x_mask=x_mask,
-                g=g,
-                n_steps=ode_steps,
-                method=infer_cfg.get("ode_method", "midpoint"),
-            )
+            if self.architecture == "direct_mel":
+                mel_hat = ema_flow.sample(
+                    content=spin_ref, f0=f0_expanded,
+                    x_mask=x_mask, g=g,
+                )
+                ode_steps = 1
+            else:
+                ode_steps = ode_steps_override or infer_cfg.get(
+                    "ode_steps", self.config["train"].get("ode_steps_infer", 4))
+                mel_hat = ema_flow.sample(
+                    content=spin_ref,
+                    f0=f0_expanded,
+                    x_mask=x_mask,
+                    g=g,
+                    n_steps=ode_steps,
+                    method=infer_cfg.get("ode_method", "midpoint"),
+                )
 
             wav_hat = ema_voc(mel_hat, f0_ref, g=g)
         return mel_hat, wav_hat, ode_steps
@@ -594,6 +641,11 @@ class KazeFlowPretrainer:
         if resume_path:
             self._load_checkpoint(resume_path)
 
+        _is_direct_mel = self.architecture == "direct_mel"
+        # Direct mel regression: no warmup phase needed
+        if _is_direct_mel:
+            cfm_warmup = 0
+
         dataloader = create_dataloader(
             filelist_path=filelist_path,
             dataset_root=dataset_root,
@@ -611,8 +663,12 @@ class KazeFlowPretrainer:
 
         if self.is_main:
             _log_section("Start")
+            logger.info(f"Architecture: {self.architecture}")
             logger.info(f"Vocoder: {self.config['model'].get('vocoder_type', 'chouwa_gan')}")
-            logger.info(f"Pretraining for {epochs} epochs ({cfm_warmup} CFM warmup)")
+            if _is_direct_mel:
+                logger.info(f"Pretraining for {epochs} epochs (direct mel — no warmup)")
+            else:
+                logger.info(f"Pretraining for {epochs} epochs ({cfm_warmup} CFM warmup)")
             logger.info(f"Dataset: {len(dataloader.dataset)} samples")
 
 
@@ -667,7 +723,7 @@ class KazeFlowPretrainer:
             # Each step count in [min, max] appears the same number of times
             # per epoch (shuffled), so the vocoder trains equally on all
             # quality levels and every ODE step count works well at inference.
-            if not in_warmup:
+            if not in_warmup and not _is_direct_mel:
                 import random as _random
                 _ode_min_cfg = train_cfg.get("ode_steps_train_min", train_cfg.get("ode_steps_train", 2))
                 _ode_max_cfg = train_cfg.get("ode_steps_train_max", train_cfg.get("ode_steps_train", 2))
@@ -677,6 +733,8 @@ class KazeFlowPretrainer:
                 # Tile to cover all batches, then trim
                 _ode_schedule = (_step_pool * ((_n_batches // len(_step_pool)) + 1))[:_n_batches]
                 _random.shuffle(_ode_schedule)
+            elif not in_warmup:
+                import random as _random
 
             for batch_idx, batch in enumerate(pbar):
                 mel, spin, f0, spk_ids, wav_gt = [x.to(self.device) for x in batch]
@@ -685,15 +743,66 @@ class KazeFlowPretrainer:
                 x_mask = torch.ones(B, 1, T, device=self.device)
                 f0_expanded = f0.unsqueeze(1)
 
-                # ── CFM Loss ─────────────────────────────────────────
+                # ── CFM / Direct Mel Loss ─────────────────────────────
                 # Gradient accumulation: zero_grad only at start of window
                 if _accum_cfm == 0:
                     self.optim_flow.zero_grad()
-                with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                    loss_cfm = self.flow(
-                        x_1=mel, x_mask=x_mask,
-                        content=spin, f0=f0_expanded, g=g,
-                    )
+
+                _loss_mel_disc = torch.tensor(0.0, device=self.device)
+                _loss_mel_gen = torch.tensor(0.0, device=self.device)
+                _loss_mel_fm_val = torch.tensor(0.0, device=self.device)
+                _loss_mel_sc = torch.tensor(0.0, device=self.device)
+                _mel_hat_adv = None
+
+                if _is_direct_mel and self.mel_disc is not None:
+                    # Direct mel + adversarial: predict mel WITH gradients
+                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        _mel_hat_adv = self.flow.predict(
+                            content=spin, f0=f0_expanded,
+                            x_mask=x_mask, g=g,
+                        )
+                        # L1 loss
+                        _C = mel.shape[1]
+                        _err = (_mel_hat_adv - mel) * x_mask
+                        loss_l1 = _err.abs().sum() / (x_mask.sum() * _C)
+
+                    # ── Mel discriminator step ───────────────────────
+                    self.optim_mel_disc.zero_grad()
+                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        _md_rs, _md_gs, _, _ = self.mel_disc(
+                            mel, _mel_hat_adv.detach(), compute_fmaps=False)
+                        _loss_mel_disc, _md_real, _md_fake = self._mel_disc_loss_fn(
+                            _md_rs, _md_gs)
+
+                    if torch.isfinite(_loss_mel_disc):
+                        self.scaler_mel_disc.scale(_loss_mel_disc).backward()
+                        self.scaler_mel_disc.unscale_(self.optim_mel_disc)
+                        torch.nn.utils.clip_grad_norm_(
+                            self._unwrap_model(self.mel_disc).parameters(),
+                            self.grad_clip_disc)
+                        self.scaler_mel_disc.step(self.optim_mel_disc)
+                    self.scaler_mel_disc.update()
+
+                    # ── Generator adversarial losses (flow) ──────────
+                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        _md_rs, _md_gs, _md_fmap_rs, _md_fmap_gs = self.mel_disc(
+                            mel, _mel_hat_adv, compute_fmaps=True)
+                        _loss_mel_gen = self._mel_gen_loss_fn(_md_gs)
+                        _loss_mel_fm_val = feature_loss(_md_fmap_rs, _md_fmap_gs)
+                        _loss_mel_sc = mel_spectral_convergence_loss(
+                            mel, _mel_hat_adv, x_mask)
+                        loss_cfm = (
+                            loss_l1
+                            + self.c_mel_adv * _loss_mel_gen
+                            + self.c_mel_fm * _loss_mel_fm_val
+                            + self.c_mel_sc * _loss_mel_sc
+                        )
+                else:
+                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        loss_cfm = self.flow(
+                            x_1=mel, x_mask=x_mask,
+                            content=spin, f0=f0_expanded, g=g,
+                        )
 
                 # NaN guard: reset accumulation and skip
                 if not torch.isfinite(loss_cfm):
@@ -744,25 +853,42 @@ class KazeFlowPretrainer:
                     continue
 
                 # ── Phase 2: Joint training ──────────────────────────
-                # ODE step count — stratified: pick from pre-shuffled schedule
-                _ode_n = _ode_schedule[batch_idx % len(_ode_schedule)]
-                self.flow.eval()
-                with torch.no_grad():
-                    mel_hat = self.flow.sample(
-                        content=spin, f0=f0_expanded,
-                        x_mask=x_mask, g=g,
-                        n_steps=_ode_n,
-                        method=train_cfg.get("ode_method_train", "euler"),
-                    )
-                self.flow.train()
+                if _is_direct_mel:
+                    # Reuse mel prediction from adversarial step if available,
+                    # otherwise generate one with no_grad
+                    if _mel_hat_adv is not None:
+                        mel_hat = _mel_hat_adv.detach()
+                    else:
+                        self.flow.eval()
+                        with torch.no_grad():
+                            mel_hat = self.flow.sample(
+                                content=spin, f0=f0_expanded,
+                                x_mask=x_mask, g=g,
+                            )
+                        self.flow.train()
+                    _ode_n = 1  # for logging
+                    # Direct mel: always feed GT mel to vocoder (no cascaded error)
+                    _voc_input_mel = mel.detach()
+                else:
+                    # ODE step count — stratified: pick from pre-shuffled schedule
+                    _ode_n = _ode_schedule[batch_idx % len(_ode_schedule)]
+                    self.flow.eval()
+                    with torch.no_grad():
+                        mel_hat = self.flow.sample(
+                            content=spin, f0=f0_expanded,
+                            x_mask=x_mask, g=g,
+                            n_steps=_ode_n,
+                            method=train_cfg.get("ode_method_train", "euler"),
+                        )
+                    self.flow.train()
 
-                # GT mel mixing: with probability gt_mel_ratio, feed the
-                # vocoder the ground-truth mel instead of the CFM prediction.
-                # This gives the vocoder clean targets to learn faithful
-                # waveform reconstruction, breaking the cascaded-error plateau.
-                _gt_mel_ratio = train_cfg.get("gt_mel_ratio", 0.0)
-                _use_gt_mel = _gt_mel_ratio > 0 and _random.random() < _gt_mel_ratio
-                _voc_input_mel = mel.detach() if _use_gt_mel else mel_hat.detach()
+                    # GT mel mixing: with probability gt_mel_ratio, feed the
+                    # vocoder the ground-truth mel instead of the CFM prediction.
+                    # This gives the vocoder clean targets to learn faithful
+                    # waveform reconstruction, breaking the cascaded-error plateau.
+                    _gt_mel_ratio = train_cfg.get("gt_mel_ratio", 0.0)
+                    _use_gt_mel = _gt_mel_ratio > 0 and _random.random() < _gt_mel_ratio
+                    _voc_input_mel = mel.detach() if _use_gt_mel else mel_hat.detach()
 
                 # Vocoder forward — only on generated mel (single forward)
                 # wav_gt from dataset provides the real audio directly,
@@ -922,6 +1048,12 @@ class KazeFlowPretrainer:
                         self.writer.add_scalar("loss/lecam", loss_lecam.item(), step)
                     # ODE step count used for this batch
                     self.writer.add_scalar("train/ode_steps", _ode_n, step)
+                    # Mel discriminator losses (direct_mel only)
+                    if self.mel_disc is not None:
+                        self.writer.add_scalar("loss/mel_disc", _loss_mel_disc.item(), step)
+                        self.writer.add_scalar("loss/mel_gen", _loss_mel_gen.item(), step)
+                        self.writer.add_scalar("loss/mel_fm", _loss_mel_fm_val.item(), step)
+                        self.writer.add_scalar("loss/mel_sc", _loss_mel_sc.item(), step)
 
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -935,6 +1067,8 @@ class KazeFlowPretrainer:
             if not in_warmup:
                 self.sched_vocoder.step()
                 self.sched_disc.step()
+                if self.sched_mel_disc is not None:
+                    self.sched_mel_disc.step()
 
             if self.is_main and (epoch + 1) % save_every == 0:
                 self._save_checkpoint(epoch + 1)
@@ -947,7 +1081,7 @@ class KazeFlowPretrainer:
                             self._get_reference_sample(dataloader)
                         mel_hat_eval, wav_hat_eval, _eval_ode = self._eval_infer(
                             ref_mel, ref_spin, ref_f0, ref_spk,
-                            ode_steps_override=_eff_ode_max,
+                            ode_steps_override=_eff_ode_max if not _is_direct_mel else None,
                         )
 
                         mel_orig_np = ref_mel[0].detach().cpu().float().numpy()
@@ -1033,7 +1167,7 @@ class KazeFlowPretrainer:
         """Save pretrain checkpoint (compatible with fine-tuning loader)."""
         path = self.output_dir / f"pretrain_{epoch}.pt"
         tmp_path = path.with_suffix(".pt.tmp")
-        torch.save({
+        ckpt_data = {
             "epoch": epoch,
             "global_step": self.global_step,
             "flow": self._normalize_checkpoint_sd(self._unwrap_model(self.flow).state_dict()),
@@ -1054,7 +1188,14 @@ class KazeFlowPretrainer:
             "lr_scheduler": self.config["train"].get("lr_scheduler", "exponential"),
             "eval_count": self._eval_count,
             "is_pretrain": True,
-        }, tmp_path)
+        }
+        if self.mel_disc is not None:
+            ckpt_data["mel_disc"] = self._normalize_checkpoint_sd(
+                self._unwrap_model(self.mel_disc).state_dict())
+            ckpt_data["optim_mel_disc"] = self.optim_mel_disc.state_dict()
+            ckpt_data["sched_mel_disc"] = self.sched_mel_disc.state_dict()
+            ckpt_data["scaler_mel_disc"] = self.scaler_mel_disc.state_dict()
+        torch.save(ckpt_data, tmp_path)
         tmp_path.replace(path)
         logger.info(f"Saved pretrain checkpoint: {path}")
 
@@ -1228,6 +1369,18 @@ class KazeFlowPretrainer:
             self.scaler_gen.load_state_dict(ckpt["scaler"])
             self.scaler_disc.load_state_dict(ckpt["scaler"])
             logger.info("Migrated single scaler → separate gen/disc scalers")
+        # Load mel discriminator state (direct_mel only)
+        if self.mel_disc is not None and "mel_disc" in ckpt:
+            mel_disc_mod = self._unwrap_model(self.mel_disc)
+            mel_disc_mod.load_state_dict(
+                self._normalize_checkpoint_sd(ckpt["mel_disc"]), strict=False)
+            if "optim_mel_disc" in ckpt:
+                self.optim_mel_disc.load_state_dict(ckpt["optim_mel_disc"])
+            if "sched_mel_disc" in ckpt:
+                self.sched_mel_disc.load_state_dict(ckpt["sched_mel_disc"])
+            if "scaler_mel_disc" in ckpt:
+                self.scaler_mel_disc.load_state_dict(ckpt["scaler_mel_disc"])
+            logger.info("Loaded mel discriminator from checkpoint")
         self.epoch = ckpt["epoch"]
         self.global_step = ckpt["global_step"]
         self._eval_count = ckpt.get("eval_count", 0)

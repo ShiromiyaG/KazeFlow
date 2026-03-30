@@ -281,6 +281,7 @@ def start_pretraining(
     resume_path: str,
     content_embedder: str,
     vocoder_type: str,
+    architecture: str,
     # Advanced
     precision: str,
     torch_compile: bool,
@@ -330,6 +331,8 @@ def start_pretraining(
             config["train"]["lr_scheduler"] = lr_scheduler
             config["train"]["gan_loss_type"] = gan_loss_type
             config["preprocess"]["content_embedder"] = content_embedder
+
+            config["model"]["architecture"] = architecture
 
             from kazeflow.models.embedder import EMBEDDER_DIMS
             config["model"]["flow_matching"]["cond_channels"] = EMBEDDER_DIMS[content_embedder]
@@ -478,6 +481,15 @@ def create_pretrain_tab():
                 ],
                 value="chouwa_gan",
                 info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior.",
+            )
+            architecture = gr.Radio(
+                label="Architecture",
+                choices=[
+                    ("Flow Matching (CFM)", "cfm"),
+                    ("Direct Mel Regression", "direct_mel"),
+                ],
+                value="cfm",
+                info="CFM: ODE-based generative model. Direct Mel: simpler, faster, deterministic — no ODE or warmup.",
             )
 
         # ── 1. Preprocess Audio ──────────────────────────────────────────
@@ -721,7 +733,7 @@ def create_pretrain_tab():
             inputs=[model_name, sample_rate,
                     batch_size, save_every, total_epochs,
                     cfm_warmup, resume_ckpt, content_embedder,
-                    vocoder_type,
+                    vocoder_type, architecture,
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,

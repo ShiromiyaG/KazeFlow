@@ -244,7 +244,7 @@ def create_inference_tab():
                 ode_steps = gr.Slider(
                     label="ODE Steps",
                     minimum=2, maximum=64, step=1, value=16,
-                    info="More steps = higher quality, slower.",
+                    info="More steps = higher quality, slower. Ignored for Direct Mel models.",
                 )
 
                 with gr.Row():
@@ -262,7 +262,7 @@ def create_inference_tab():
                 guidance_scale = gr.Slider(
                     label="Guidance Scale (CFG)",
                     minimum=1.0, maximum=5.0, step=0.1, value=1.0,
-                    info="1.0 = off. Higher = stronger speaker conditioning. Try 1.5–3.0.",
+                    info="1.0 = off. Higher = stronger speaker conditioning. Ignored for Direct Mel models.",
                 )
 
                 with gr.Accordion("FAISS Index", open=False):
