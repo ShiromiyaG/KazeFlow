@@ -169,7 +169,13 @@
     "ode_steps_train_min": 2,
     "ode_steps_train_max": 16,
     "gt_mel_ratio": 0.0,
-    "n_disc_steps": 1
+    "n_disc_steps": 1,
+    "e2e_epochs": 0,
+    "e2e_lr_scale": 0.1,
+    "c_e2e_wav": 0.1,
+    "e2e_grad_clip_flow": 1.0,
+    "e2e_grad_checkpoint": true,
+    "e2e_segment_frames": 0
   },
   "inference": {
     "ode_steps": 4,

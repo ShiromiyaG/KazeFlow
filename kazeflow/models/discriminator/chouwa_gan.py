@@ -150,8 +150,8 @@ class HarmonicFilterbank(nn.Module):
         B, F, T = stft_mag.shape      # F = n_fft//2+1 from the real input tensor
 
         filt_t = filt.permute(0, 2, 1)
-        filt_exp = filt_t.unsqueeze(0).expand(B, -1, -1, -1).reshape(B * H, K, F)
-        mag_exp = stft_mag.unsqueeze(1).expand(-1, H, -1, -1).reshape(B * H, F, T)
+        filt_exp = filt_t.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * H, K, F)
+        mag_exp = stft_mag.unsqueeze(1).expand(-1, H, -1, -1).contiguous().view(B * H, F, T)
         out = torch.bmm(filt_exp, mag_exp)
         return out.reshape(B, H, K, T)
 

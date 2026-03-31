@@ -16,6 +16,7 @@ embedding alone drives AdaGN modulation.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Optional, Tuple
 
 
@@ -34,7 +35,9 @@ class SpeakerAdaGN(nn.Module):
         self.proj.bias.data[channels:] = 0.0  # shift = 0
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
+        # Upcast to fp32 for GroupNorm variance stability in fp16
+        dtype = x.dtype
+        h = self.norm(x.float()).to(dtype)
         scale_shift = self.proj(cond)
         scale, shift = scale_shift.chunk(2, dim=-1)
         return h * scale[:, :, None] + shift[:, :, None]
@@ -120,8 +123,11 @@ class Snake(nn.Module):
         self.alpha = nn.Parameter(torch.full((1, channels, 1), alpha_init))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = self.alpha.clamp(min=1e-5)
-        return x + (1.0 / a) * torch.sin(a * x) ** 2
+        # Upcast to fp32: a*x product can overflow fp16 range
+        dtype = x.dtype
+        x_f = x.float()
+        a = self.alpha.float().clamp(min=1e-4)
+        return (x_f + (1.0 / a) * torch.sin(a * x_f) ** 2).to(dtype)
 
 
 class MelEstimator(nn.Module):
@@ -135,6 +141,13 @@ class MelEstimator(nn.Module):
     F0 is embedded through a dedicated path (voiced/unvoiced aware).
     Output uses Snake activation for harmonic bias.
     Skip connections use learned per-layer scaling.
+
+    **Stochastic bottleneck**: during training, learnable per-channel
+    Gaussian noise is injected after the content projection.  This
+    regularises the content→mel mapping so the model produces
+    high-quality mel even when inference-time features deviate slightly
+    from the pre-extracted training features.  At inference the noise
+    is disabled (deterministic output).
     """
 
     def __init__(
@@ -147,10 +160,12 @@ class MelEstimator(nn.Module):
         kernel_size: int = 7,
         dilation_rate: int = 2,
         dropout: float = 0.05,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.mel_channels = mel_channels
+        self.use_checkpoint = use_checkpoint
 
         # Speaker projection -> conditioning dimension for AdaGN
         spk_dim = hidden_channels * 2
@@ -165,6 +180,16 @@ class MelEstimator(nn.Module):
 
         # Content projection: content features -> hidden (no F0 concat)
         self.cond_proj = nn.Conv1d(cond_channels, hidden_channels, 1)
+
+        # Stochastic bottleneck: per-channel learnable noise scale.
+        # Initialized to a small value (softplus(inv) ≈ 0.02) so the model
+        # starts near-deterministic and learns how much noise it needs.
+        # During eval (inference) this is skipped entirely.
+        _init_noise = 0.02
+        _inv = torch.log(torch.exp(torch.tensor(_init_noise)) - 1.0)  # softplus inverse
+        self.noise_logscale = nn.Parameter(
+            torch.full((1, hidden_channels, 1), _inv.item())
+        )
 
         # Gated DS conv blocks with exponential dilations
         self.blocks = nn.ModuleList()
@@ -203,18 +228,31 @@ class MelEstimator(nn.Module):
         # Content + dedicated F0 embedding (additive, not concat)
         f0_feat = self.f0_cond(f0)                     # (B, H, T)
         h = self.cond_proj(content) + f0_feat           # (B, H, T)
+
+        # Stochastic bottleneck: inject learnable noise during training
+        if self.training:
+            noise_scale = F.softplus(self.noise_logscale)   # always positive
+            h = h + torch.randn_like(h) * noise_scale
+
         h = h * x_mask
 
         # Gated DS conv stack with adaptive skip accumulation
-        skip_sum = torch.zeros_like(h)
+        # Accumulate in fp32 to avoid fp16 overflow across N layers
+        skip_sum = torch.zeros_like(h, dtype=torch.float32)
         for i, block in enumerate(self.blocks):
-            h, skip = block(h, spk_cond, x_mask)
-            skip_sum = skip_sum + self.skip_scale[i] * skip
+            if self.use_checkpoint and self.training:
+                h, skip = grad_checkpoint(
+                    block, h, spk_cond, x_mask,
+                    use_reentrant=False,
+                )
+            else:
+                h, skip = block(h, spk_cond, x_mask)
+            skip_sum = skip_sum + self.skip_scale[i].float() * skip.float()
 
         # Normalize by L2 norm of skip scales (not fixed sqrt(N))
-        norm = self.skip_scale.norm().clamp(min=1e-5)
-        h = skip_sum / norm
-        h = self.out_norm(h)
+        norm = self.skip_scale.float().norm().clamp(min=1e-4)
+        h = (skip_sum / norm).to(h.dtype)
+        h = self.out_norm(h.float()).to(content.dtype)
         h = self.snake(h)
         mel = self.out_proj(h) * x_mask
         return mel
@@ -241,6 +279,7 @@ class DirectMelPredictor(nn.Module):
         kernel_size: int = 7,
         dilation_rate: int = 2,
         dropout: float = 0.05,
+        use_checkpoint: bool = False,
         # Unused CFM params — accepted for config compatibility
         sigma_min: float = 1e-4,
         t_sampling: str = "logit_normal",
@@ -258,6 +297,7 @@ class DirectMelPredictor(nn.Module):
             kernel_size=kernel_size,
             dilation_rate=dilation_rate,
             dropout=dropout,
+            use_checkpoint=use_checkpoint,
         )
 
     def predict(
@@ -281,10 +321,10 @@ class DirectMelPredictor(nn.Module):
         """Training forward: compute L1 mel prediction loss."""
         mel_hat = self.estimator(content, f0, x_mask, g)
 
-        # L1 loss (masked)
+        # L1 loss — compute in fp32 to avoid sum overflow in fp16
         C = x_1.shape[1]
-        error = (mel_hat - x_1) * x_mask
-        loss = error.abs().sum() / (x_mask.sum() * C)
+        error = ((mel_hat - x_1) * x_mask).float()
+        loss = error.abs().sum() / (x_mask.float().sum() * C)
         return loss
 
     @torch.no_grad()

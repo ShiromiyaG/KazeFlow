@@ -164,6 +164,7 @@ def run_feature_extraction(
     model_name: str,
     sample_rate: int,
     content_embedder: str = "rspin",
+    architecture: str = "cfm",
 ):
     """Stage 2: Extract embeddings, pitch, mel. Deletes existing features to redo."""
     global _training_status
@@ -191,6 +192,7 @@ def run_feature_extraction(
         config = load_config(sample_rate=int(sample_rate))
 
         config["preprocess"]["content_embedder"] = content_embedder
+        config["model"]["architecture"] = architecture
 
         pipeline = PreprocessPipeline(
             config=config,
@@ -263,6 +265,7 @@ def start_training(
     batch_size: int,
     save_every: int,
     epochs: int,
+    e2e_epochs_val: int,
     pretrain_path: str,
     resume_path: str,
     content_embedder: str,
@@ -331,6 +334,9 @@ def start_training(
                 config["train"]["save_every"] = save_every
             if epochs > 0:
                 config["train"]["epochs"] = epochs
+
+            if e2e_epochs_val > 0:
+                config["train"]["e2e_epochs"] = int(e2e_epochs_val)
 
             import torch
             from kazeflow.train.trainer import KazeFlowTrainer
@@ -531,6 +537,10 @@ def create_training_tab():
                         label="Total Epochs", value=500, precision=0, minimum=0,
                         info="0 = config default",
                     )
+                    e2e_epochs = gr.Number(
+                        label="E2E Epochs", value=0, precision=0, minimum=0,
+                        info="End-to-end fine-tune: wav loss → flow. 0 = off. DirectMel only.",
+                    )
 
             with gr.Group():
                 gr.Markdown("#### Checkpoints")
@@ -583,19 +593,19 @@ def create_training_tab():
                         lr_scheduler = gr.Dropdown(
                             label="LR Scheduler",
                             choices=["exponential", "cosine"],
-                            value="cosine",
-                            info="cosine: better convergence for long runs.",
+                            value="exponential",
+                            info="exponential: smooth decay, best for fine-tuning. cosine: better for training from scratch.",
                         )
                         gan_loss_type = gr.Dropdown(
                             label="GAN Loss Type",
-                            choices=["hinge", "soft_hinge", "lsgan"],
-                            value="soft_hinge",
-                            info="soft_hinge: recommended (softplus disc for SAN).",
+                            choices=["lsgan", "hinge", "soft_hinge"],
+                            value="lsgan",
+                            info="lsgan: smooth, stable, best for fine-tuning. soft_hinge: better for pretraining from scratch.",
                         )
                     gradient_balancer = gr.Checkbox(
                         label="Gradient Balancer",
-                        value=True,
-                        info="Auto-balance mel/GAN gradient magnitudes (prevents GAN from dominating mel/STFT).",
+                        value=False,
+                        info="Auto-balance mel/GAN gradient magnitudes. Adds overhead — leave off unless needed.",
                     )
 
             with gr.Row():
@@ -652,14 +662,14 @@ def create_training_tab():
         )
         extract_btn.click(
             fn=run_feature_extraction,
-            inputs=[model_name, sample_rate, content_embedder],
+            inputs=[model_name, sample_rate, content_embedder, architecture],
             outputs=[extract_status],
         )
         train_btn.click(
             fn=start_training,
             inputs=[model_name, sample_rate,
                     batch_size, save_every, training_epochs,
-                    pretrain_ckpt, resume_ckpt, content_embedder,
+                    e2e_epochs, pretrain_ckpt, resume_ckpt, content_embedder,
                     vocoder_type, architecture,
                     # Advanced
                     precision, torch_compile, compile_mode,

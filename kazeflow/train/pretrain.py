@@ -463,7 +463,16 @@ class KazeFlowPretrainer:
             + (f" + SAN (softplus disc + soft_hinge gen)"
                if _use_san else "")
         )
-        self.grad_clip_flow = train_cfg["grad_clip_flow"]
+        # Flow grad clip: direct_mel has L1 + adversarial losses that produce
+        # much larger gradients than CFM's unit MSE loss.  Using CFM's clip
+        # (3.0) truncates most gradient updates, starving the model.
+        if self.architecture == "direct_mel":
+            self.grad_clip_flow = train_cfg.get(
+                "grad_clip_flow_direct_mel",
+                train_cfg.get("grad_clip_flow", 10.0),
+            )
+        else:
+            self.grad_clip_flow = train_cfg["grad_clip_flow"]
         self.grad_clip_voc = train_cfg["grad_clip_vocoder"]
         self.grad_clip_disc = train_cfg["grad_clip_disc"]
         self.c_lecam = train_cfg.get("c_lecam", 0.0)
@@ -645,6 +654,7 @@ class KazeFlowPretrainer:
         # Direct mel regression: no warmup phase needed
         if _is_direct_mel:
             cfm_warmup = 0
+        e2e_epochs = train_cfg.get("e2e_epochs", 0) if _is_direct_mel else 0
 
         dataloader = create_dataloader(
             filelist_path=filelist_path,
@@ -667,10 +677,13 @@ class KazeFlowPretrainer:
             logger.info(f"Vocoder: {self.config['model'].get('vocoder_type', 'chouwa_gan')}")
             if _is_direct_mel:
                 logger.info(f"Pretraining for {epochs} epochs (direct mel — no warmup)")
+                if e2e_epochs > 0:
+                    logger.info(f"  └─ Last {e2e_epochs} epochs: end-to-end (wav loss → flow)")
             else:
                 logger.info(f"Pretraining for {epochs} epochs ({cfm_warmup} CFM warmup)")
             logger.info(f"Dataset: {len(dataloader.dataset)} samples")
 
+        _e2e_lr_applied = False
 
         for epoch in range(self.epoch, epochs):
             # Check stop signal before starting a new epoch
@@ -680,10 +693,67 @@ class KazeFlowPretrainer:
 
             self.epoch = epoch
             in_warmup = epoch < cfm_warmup
+            in_e2e = (
+                _is_direct_mel and e2e_epochs > 0
+                and epoch >= (epochs - e2e_epochs)
+            )
             if in_warmup:
                 phase = "Warmup"
+            elif in_e2e:
+                phase = "E2E"
             else:
                 phase = "Joint"
+
+            # Scale down flow LR once when entering E2E
+            if in_e2e and not _e2e_lr_applied:
+                _e2e_lr_scale = train_cfg.get("e2e_lr_scale", 0.1)
+                for pg in self.optim_flow.param_groups:
+                    pg['lr'] *= _e2e_lr_scale
+                _e2e_lr_applied = True
+                # Enable gradient checkpointing to save VRAM
+                if train_cfg.get("e2e_grad_checkpoint", True):
+                    _flow_raw = self._unwrap_model(self.flow)
+                    if hasattr(_flow_raw, 'estimator'):
+                        _flow_raw.estimator.use_checkpoint = True
+                    _voc_raw = self._unwrap_model(self.vocoder)
+                    if hasattr(_voc_raw, 'resblocks'):
+                        for rb in _voc_raw.resblocks:
+                            rb.use_checkpoint = True
+                    if self.is_main:
+                        logger.info("E2E: gradient checkpointing enabled (flow + vocoder)")
+                # Freeze vocoder: acts as fixed differentiable lens.
+                # Grads still flow THROUGH it to the flow, but vocoder
+                # params don't accumulate grads → saves ~3× vocoder size.
+                self._unwrap_model(self.vocoder).requires_grad_(False)
+                if self.is_main:
+                    logger.info("E2E: vocoder frozen (differentiable lens)")
+                # Offload mel disc to CPU (unused during E2E, frees VRAM)
+                if self.mel_disc is not None:
+                    self.mel_disc.cpu()
+                    if self.is_main:
+                        logger.info("E2E: mel_disc offloaded to CPU")
+                # Recreate dataloader with shorter segments if configured
+                _e2e_seg = train_cfg.get("e2e_segment_frames", 0)
+                if _e2e_seg > 0 and _e2e_seg != self.segment_frames:
+                    dataloader = create_dataloader(
+                        filelist_path=filelist_path,
+                        dataset_root=dataset_root,
+                        batch_size=train_cfg["batch_size"],
+                        segment_frames=_e2e_seg,
+                        n_mels=self.n_mels,
+                        hop_length=self.hop_length,
+                        sample_rate=self.sample_rate,
+                        num_workers=train_cfg["num_workers"],
+                        pin_memory=train_cfg.get("pin_memory", True),
+                        content_embedder=self.config["preprocess"].get("content_embedder", "spin_v2"),
+                    )
+                    if self.is_main:
+                        logger.info(f"E2E: segment_frames {self.segment_frames} → {_e2e_seg}")
+                if self.is_main:
+                    logger.info(
+                        f"E2E phase: scaled flow LR by {_e2e_lr_scale} "
+                        f"→ {self.optim_flow.param_groups[0]['lr']:.2e}"
+                    )
 
             # Recreate dataloader at warmup→joint transition to start
             # loading GT waveforms (skip_wav=False) for vocoder training.
@@ -753,18 +823,19 @@ class KazeFlowPretrainer:
                 _loss_mel_fm_val = torch.tensor(0.0, device=self.device)
                 _loss_mel_sc = torch.tensor(0.0, device=self.device)
                 _mel_hat_adv = None
+                _md_rs = _md_gs = _md_fmap_rs = _md_fmap_gs = None
 
-                if _is_direct_mel and self.mel_disc is not None:
+                if _is_direct_mel and self.mel_disc is not None and not in_e2e:
                     # Direct mel + adversarial: predict mel WITH gradients
                     with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                         _mel_hat_adv = self.flow.predict(
                             content=spin, f0=f0_expanded,
                             x_mask=x_mask, g=g,
                         )
-                        # L1 loss
+                        # L1 in fp32 to avoid sum overflow in fp16
                         _C = mel.shape[1]
-                        _err = (_mel_hat_adv - mel) * x_mask
-                        loss_l1 = _err.abs().sum() / (x_mask.sum() * _C)
+                        _err = ((_mel_hat_adv - mel) * x_mask).float()
+                        loss_l1 = _err.abs().sum() / (x_mask.float().sum() * _C)
 
                     # ── Mel discriminator step ───────────────────────
                     self.optim_mel_disc.zero_grad()
@@ -797,6 +868,17 @@ class KazeFlowPretrainer:
                             + self.c_mel_fm * _loss_mel_fm_val
                             + self.c_mel_sc * _loss_mel_sc
                         )
+                elif _is_direct_mel and in_e2e:
+                    # E2E: skip mel disc — waveform losses update flow directly.
+                    # Only compute L1 as mel-space anchor.
+                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        _mel_hat_adv = self.flow.predict(
+                            content=spin, f0=f0_expanded,
+                            x_mask=x_mask, g=g,
+                        )
+                        _C = mel.shape[1]
+                        _err = ((_mel_hat_adv - mel) * x_mask).float()
+                        loss_cfm = _err.abs().sum() / (x_mask.float().sum() * _C)
                 else:
                     with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                         loss_cfm = self.flow(
@@ -819,18 +901,23 @@ class KazeFlowPretrainer:
 
                 # Scale loss to average gradients over accumulation window
                 # During warmup, always step every batch (no accumulation needed)
-                effective_accum = 1 if in_warmup else self.cfm_grad_accum
-                self.scaler_flow.scale(loss_cfm / effective_accum).backward()
-                _accum_cfm += 1
-                _do_flow_step = (_accum_cfm == effective_accum)
+                if in_e2e:
+                    # E2E: don't backward flow loss yet — it will be combined
+                    # with waveform losses and backward'd in a single pass
+                    _do_flow_step = True
+                else:
+                    effective_accum = 1 if in_warmup else self.cfm_grad_accum
+                    self.scaler_flow.scale(loss_cfm / effective_accum).backward()
+                    _accum_cfm += 1
+                    _do_flow_step = (_accum_cfm == effective_accum)
 
-                if _do_flow_step:
-                    self.scaler_flow.unscale_(self.optim_flow)
-                    _gn_flow = torch.nn.utils.clip_grad_norm_(
-                        self.flow.parameters(), self.grad_clip_flow)
-                    self.scaler_flow.step(self.optim_flow)
-                    self.ema_flow.update()
-                    _accum_cfm = 0
+                    if _do_flow_step:
+                        self.scaler_flow.unscale_(self.optim_flow)
+                        _gn_flow = torch.nn.utils.clip_grad_norm_(
+                            self.flow.parameters(), self.grad_clip_flow)
+                        self.scaler_flow.step(self.optim_flow)
+                        self.ema_flow.update()
+                        _accum_cfm = 0
 
                 if in_warmup:
                     if _do_flow_step:
@@ -838,11 +925,11 @@ class KazeFlowPretrainer:
                     # Phase 1: Only CFM, skip vocoder/discriminator
                     self.global_step += 1
 
-                    pbar.set_postfix(cfm=f"{loss_cfm.item():.4f}")
+                    pbar.set_postfix(flow=f"{loss_cfm.item():.4f}")
                     if self.is_main and self.global_step % log_every == 0:
                         step = self.global_step
                         self.writer.add_scalar(
-                            "loss/cfm", loss_cfm.item(), step)
+                            "loss/flow", loss_cfm.item(), step)
                         self.writer.add_scalar(
                             "grad_norm/flow", _gn_flow.item(), step)
                         self.writer.add_scalar(
@@ -854,21 +941,41 @@ class KazeFlowPretrainer:
 
                 # ── Phase 2: Joint training ──────────────────────────
                 if _is_direct_mel:
-                    # Reuse mel prediction from adversarial step if available,
-                    # otherwise generate one with no_grad
-                    if _mel_hat_adv is not None:
-                        mel_hat = _mel_hat_adv.detach()
+                    if in_e2e:
+                        # E2E: keep gradient graph — mel_hat connects to vocoder
+                        # so waveform loss backprops through vocoder → mel_hat → flow
+                        if _mel_hat_adv is not None:
+                            mel_hat = _mel_hat_adv
+                        else:
+                            with torch.amp.autocast("cuda", enabled=self.use_amp,
+                                                    dtype=self.amp_dtype):
+                                mel_hat = self.flow.predict(
+                                    content=spin, f0=f0_expanded,
+                                    x_mask=x_mask, g=g,
+                                )
+                        _voc_input_mel = mel_hat  # connected graph
                     else:
-                        self.flow.eval()
-                        with torch.no_grad():
-                            mel_hat = self.flow.sample(
-                                content=spin, f0=f0_expanded,
-                                x_mask=x_mask, g=g,
-                            )
-                        self.flow.train()
+                        # Reuse mel prediction from adversarial step if available,
+                        # otherwise generate one with no_grad
+                        if _mel_hat_adv is not None:
+                            mel_hat = _mel_hat_adv.detach()
+                        else:
+                            self.flow.eval()
+                            with torch.no_grad():
+                                mel_hat = self.flow.sample(
+                                    content=spin, f0=f0_expanded,
+                                    x_mask=x_mask, g=g,
+                                )
+                            self.flow.train()
+                        # Direct mel: always feed GT mel to vocoder (no cascaded error)
+                        _voc_input_mel = mel.detach()
                     _ode_n = 1  # for logging
-                    # Direct mel: always feed GT mel to vocoder (no cascaded error)
-                    _voc_input_mel = mel.detach()
+                    # Free mel disc intermediates before vocoder step
+                    del _mel_hat_adv, _md_rs, _md_gs
+                    del _md_fmap_rs, _md_fmap_gs
+                    _mel_hat_adv = None
+                    if not in_e2e:
+                        torch.cuda.empty_cache()
                 else:
                     # ODE step count — stratified: pick from pre-shuffled schedule
                     _ode_n = _ode_schedule[batch_idx % len(_ode_schedule)]
@@ -900,8 +1007,8 @@ class KazeFlowPretrainer:
 
                     # Align lengths (vocoder iSTFT output may differ slightly)
                     target_len = min(wav_hat.shape[-1], wav_gt.shape[-1])
-                    wav_hat = wav_hat[..., :target_len]
-                    wav_real_det = wav_gt[..., :target_len].detach()
+                    wav_hat = wav_hat[..., :target_len].contiguous()
+                    wav_real_det = wav_gt[..., :target_len].detach().contiguous()
 
                 # Discriminator — repeated n_disc_steps times per gen step
                 gn_disc = None
@@ -989,6 +1096,8 @@ class KazeFlowPretrainer:
                         f"{bad}, skipping vocoder step"
                     )
                     self.optim_vocoder.zero_grad(set_to_none=True)
+                    if in_e2e:
+                        self.optim_flow.zero_grad(set_to_none=True)
                     gn_voc = None
                 else:
                     loss_voc = (
@@ -997,27 +1106,42 @@ class KazeFlowPretrainer:
                         + self.c_mel * loss_mel
                         + self.c_mrstft * loss_mrstft
                     )
-                    self.scaler_gen.scale(loss_voc).backward()
-                    self.scaler_gen.unscale_(self.optim_vocoder)
-                    gn_voc = torch.nn.utils.clip_grad_norm_(
-                        self.vocoder.parameters(), self.grad_clip_voc)
-                    self.scaler_gen.step(self.optim_vocoder)
-                    self.ema_vocoder.update()
+                    if in_e2e:
+                        # E2E: combine mel-space + wav-space into one backward
+                        # Grads flow through vocoder → mel_hat → flow
+                        # Vocoder is frozen — only flow optimizer steps.
+                        _c_e2e = train_cfg.get("c_e2e_wav", 0.1)
+                        loss_e2e = loss_cfm + _c_e2e * loss_voc
+                        self.scaler_gen.scale(loss_e2e).backward()
+                        self.scaler_gen.unscale_(self.optim_flow)
+                        _e2e_clip = train_cfg.get("e2e_grad_clip_flow", 1.0)
+                        _gn_flow = torch.nn.utils.clip_grad_norm_(
+                            self.flow.parameters(), _e2e_clip)
+                        self.scaler_gen.step(self.optim_flow)
+                        self.ema_flow.update()
+                        gn_voc = None
+                    else:
+                        self.scaler_gen.scale(loss_voc).backward()
+                        self.scaler_gen.unscale_(self.optim_vocoder)
+                        gn_voc = torch.nn.utils.clip_grad_norm_(
+                            self.vocoder.parameters(), self.grad_clip_voc)
+                        self.scaler_gen.step(self.optim_vocoder)
+                        self.ema_vocoder.update()
 
-                if _do_flow_step:
+                if not in_e2e and _do_flow_step:
                     self.scaler_flow.update()
                 self.scaler_gen.update()
                 self.global_step += 1
 
                 pbar.set_postfix(
-                    cfm=f"{loss_cfm.item():.4f}",
+                    flow=f"{loss_cfm.item():.4f}",
                     mel=f"{loss_mel.item():.4f}",
                     disc=f"{loss_disc.item():.4f}",
                 )
                 if self.is_main and self.global_step % log_every == 0:
                     step = self.global_step
                     # Losses
-                    self.writer.add_scalar("loss/cfm", loss_cfm.item(), step)
+                    self.writer.add_scalar("loss/flow", loss_cfm.item(), step)
                     self.writer.add_scalar("loss/disc", loss_disc.item(), step)
                     self.writer.add_scalar("loss/gen", loss_gen.item(), step)
                     self.writer.add_scalar("loss/fm", loss_fm.item(), step)
@@ -1054,6 +1178,9 @@ class KazeFlowPretrainer:
                         self.writer.add_scalar("loss/mel_gen", _loss_mel_gen.item(), step)
                         self.writer.add_scalar("loss/mel_fm", _loss_mel_fm_val.item(), step)
                         self.writer.add_scalar("loss/mel_sc", _loss_mel_sc.item(), step)
+                    # E2E combined loss
+                    if in_e2e and gn_voc is not None:
+                        self.writer.add_scalar("loss/e2e", loss_e2e.item(), step)
 
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -1063,7 +1190,8 @@ class KazeFlowPretrainer:
             if stop_event is not None and stop_event.is_set():
                 break
 
-            self.sched_flow.step()
+            if not in_e2e:
+                self.sched_flow.step()
             if not in_warmup:
                 self.sched_vocoder.step()
                 self.sched_disc.step()
@@ -1247,8 +1375,10 @@ class KazeFlowPretrainer:
     def _load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         flow = self._unwrap_model(self.flow)
-        flow.load_state_dict(
-            self._align_state_dict(self._normalize_checkpoint_sd(ckpt["flow"]), flow))
+        _flow_sd = self._align_state_dict(self._normalize_checkpoint_sd(ckpt["flow"]), flow)
+        _flow_result = flow.load_state_dict(_flow_sd, strict=False)
+        if _flow_result.missing_keys:
+            logger.info(f"Flow load: new params initialized from defaults: {_flow_result.missing_keys}")
         vocoder = self._unwrap_model(self.vocoder)
         vocoder.load_state_dict(
             self._align_state_dict(self._normalize_checkpoint_sd(ckpt["vocoder"]), vocoder))

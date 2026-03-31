@@ -47,6 +47,11 @@ class KazeFlowDataset(Dataset):
     avoiding a second vocoder forward pass (which would double VRAM usage).
 
     Random segment cropping is done here for efficiency.
+
+    Feature augmentation (when enabled) perturbs SPIN and F0 features
+    during training so the model learns to produce high-quality mel
+    from slightly imperfect conditioning — critical for inference where
+    features are extracted live from unseen audio.
     """
 
     def __init__(
@@ -167,6 +172,7 @@ class KazeFlowDataset(Dataset):
             if wav.shape[0] < audio_len:
                 wav = F.pad(wav, (0, audio_len - wav.shape[0]))
 
+
         # Ensure exact audio length (iSTFT may need exact alignment)
         target_audio_len = self.segment_frames * self.hop_length
         if wav.shape[0] > target_audio_len:
@@ -175,6 +181,7 @@ class KazeFlowDataset(Dataset):
             wav = F.pad(wav, (0, target_audio_len - wav.shape[0]))
 
         return mel, spin, f0, spk_id, wav
+
 
 
 class KazeFlowCollator:
@@ -224,3 +231,4 @@ def create_dataloader(
         drop_last=True,
         persistent_workers=num_workers > 0,
     )
+

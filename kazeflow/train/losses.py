@@ -13,6 +13,7 @@ All epsilon values use 1e-4 minimum for FP16 safety (FP16 min subnormal ≈ 6e-8
 but practical safe floor for divisions/logs under mixed precision is ~1e-4).
 """
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -579,23 +580,36 @@ class GradientBalancer:
                 if grad is not None:
                     # Unscale if using scaler
                     if scaler is not None:
-                        grad = grad / scaler.get_scale()
-                    grad_norms[name] = grad.detach().norm().item()
-                else:
-                    grad_norms[name] = 0.0
-            else:
-                grad_norms[name] = 0.0
+                        inv_scale = scaler.get_scale()
+                        if inv_scale > 0:
+                            grad = grad / inv_scale
+                        else:
+                            grad = None
+                if grad is not None:
+                    gn = grad.detach().float().norm().item()
+                    # FP16 scaler overflow can produce inf/nan grad norms
+                    # on early steps — treat as unmeasured (skip)
+                    if math.isfinite(gn):
+                        grad_norms[name] = gn
+            # If we didn't get a finite norm, leave out of grad_norms
+            # so the EMA update skips this name for this step.
 
         # Step 2: Update EMA of gradient norms
         if not self._initialized:
+            # Only initialize with names that have finite grad norms;
+            # fall back to 1.0 for anything missing (harmless neutral value)
             for name in losses:
                 self._ema_norms[name] = grad_norms.get(name, 1.0)
-            self._initialized = True
+            # Consider initialized only when we got at least one real measurement
+            if grad_norms:
+                self._initialized = True
         else:
             for name in losses:
-                old = self._ema_norms.get(name, grad_norms.get(name, 1.0))
-                new = grad_norms.get(name, 0.0)
-                self._ema_norms[name] = self.ema_decay * old + (1 - self.ema_decay) * new
+                if name in grad_norms:
+                    old = self._ema_norms.get(name, 1.0)
+                    new = grad_norms[name]
+                    self._ema_norms[name] = self.ema_decay * old + (1 - self.ema_decay) * new
+                # If name not in grad_norms (overflow step), keep old EMA value
 
         # Step 3: Compute balanced coefficients
         # Target: each loss contributes gradient proportional to its weight

@@ -63,7 +63,8 @@ class MelSubDiscriminator(nn.Module):
             fmaps.append(x)
         x = self.conv_post(x)
         fmaps.append(x)
-        return x.flatten(1, -1), fmaps
+        # Flatten in fp32 to avoid overflow when scores are summed externally
+        return x.float().flatten(1, -1), fmaps
 
 
 class MultiScaleMelDiscriminator(nn.Module):

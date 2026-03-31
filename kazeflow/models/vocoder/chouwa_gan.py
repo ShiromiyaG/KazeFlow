@@ -750,9 +750,14 @@ class EMAGenerator:
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay
         self.shadow = copy.deepcopy(model)
+        # EMA shadow MUST be FP32 — with decay=0.999, the lerp weight
+        # (1-decay = 0.001) is below FP16 precision for many parameter
+        # magnitudes, causing NaN / zero accumulation.
+        self.shadow.float()
         self.shadow.eval()
         self.shadow.requires_grad_(False)
         self._source = model
+        self._source_dtype = next(model.parameters()).dtype
 
     @torch.no_grad()
     def update(self):

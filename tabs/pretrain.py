@@ -142,6 +142,7 @@ def run_pretrain_feature_extraction(
     model_name: str,
     sample_rate: int,
     content_embedder: str = "rspin",
+    architecture: str = "cfm",
 ):
     """Stage 2: Extract embeddings, pitch, mel. Deletes existing features to redo."""
     global _pretrain_status
@@ -169,6 +170,7 @@ def run_pretrain_feature_extraction(
         config = load_config(sample_rate=int(sample_rate))
 
         config["preprocess"]["content_embedder"] = content_embedder
+        config["model"]["architecture"] = architecture
 
         pipeline = PreprocessPipeline(
             config=config,
@@ -278,6 +280,7 @@ def start_pretraining(
     save_every: int,
     epochs: int,
     cfm_warmup_epochs: int,
+    e2e_epochs_val: int,
     resume_path: str,
     content_embedder: str,
     vocoder_type: str,
@@ -346,6 +349,9 @@ def start_pretraining(
 
             if cfm_warmup_epochs >= 0:
                 config["train"]["cfm_warmup_epochs"] = int(cfm_warmup_epochs)
+
+            if e2e_epochs_val > 0:
+                config["train"]["e2e_epochs"] = int(e2e_epochs_val)
 
             # ── High-Throughput overrides ──────────────────────────────
             if training_profile == "high_throughput":
@@ -596,6 +602,10 @@ def create_pretrain_tab():
                         label="CFM Warmup (epochs)", value=20, precision=0, minimum=-1,
                         info="-1 = config default. CFM-only phase before vocoder.",
                     )
+                    e2e_epochs = gr.Number(
+                        label="E2E Epochs", value=0, precision=0, minimum=0,
+                        info="End-to-end fine-tune: wav loss → flow. 0 = off. DirectMel only.",
+                    )
 
             with gr.Group():
                 gr.Markdown("#### Resume")
@@ -725,14 +735,14 @@ def create_pretrain_tab():
         )
         extract_btn.click(
             fn=run_pretrain_feature_extraction,
-            inputs=[model_name, sample_rate, content_embedder],
+            inputs=[model_name, sample_rate, content_embedder, architecture],
             outputs=[extract_status],
         )
         train_btn.click(
             fn=start_pretraining,
             inputs=[model_name, sample_rate,
                     batch_size, save_every, total_epochs,
-                    cfm_warmup, resume_ckpt, content_embedder,
+                    cfm_warmup, e2e_epochs, resume_ckpt, content_embedder,
                     vocoder_type, architecture,
                     # Advanced
                     precision, torch_compile, compile_mode,

@@ -106,7 +106,9 @@ class KazeFlowPipeline:
             sr=model_cfg["sample_rate"],
             **model_cfg["vocoder"],
         ).to(self.device).eval()
-        self.vocoder.remove_weight_norm()
+        # NOTE: Do NOT remove_weight_norm yet — the EMA state dict stores
+        # parametrized keys (original0/1).  We load weights first, then
+        # remove WN so PyTorch collapses them natively (no manual error).
 
         # Speaker embedding
         n_speakers = model_cfg.get("n_speakers", 1)
@@ -115,15 +117,49 @@ class KazeFlowPipeline:
             n_speakers, spk_dim
         ).to(self.device)
 
-        # Load weights
+        # Load weights — prefer EMA shadows (higher quality, matches eval)
+        # Fall back to raw training weights for old checkpoints without EMA
         ckpt = torch.load(checkpoint_path, map_location=self.device,
                           weights_only=False)
-        self.flow.load_state_dict(_deparametrize_state_dict(ckpt["flow"]))
-        self.vocoder.load_state_dict(
-            _deparametrize_state_dict(ckpt["vocoder"]))
+        _flow_sd = ckpt.get("flow_ema", ckpt["flow"])
+        _voc_sd = ckpt.get("vocoder_ema", ckpt["vocoder"])
+        self.flow.load_state_dict(_deparametrize_state_dict(_flow_sd))
+
+        # Vocoder loading: the EMA state dict has weight_norm parametrized
+        # keys (original0/original1).  Load into the model WITH weight_norm
+        # intact so PyTorch matches the parametrizations natively, then
+        # remove_weight_norm() collapses them.
+        _load_result = self.vocoder.load_state_dict(_voc_sd, strict=False)
+        if _load_result.missing_keys:
+            # Weight-norm keys won't match if checkpoint has plain weights
+            # (old format). Try deparametrize + reload.
+            _dp_sd = _deparametrize_state_dict(_voc_sd)
+            # Must remove WN first so model expects plain keys
+            self.vocoder.remove_weight_norm()
+            _load_result = self.vocoder.load_state_dict(_dp_sd, strict=False)
+            _wn_removed = True
+        else:
+            # Loaded successfully with WN keys — remove WN natively
+            self.vocoder.remove_weight_norm()
+            _wn_removed = False
+
+        if _load_result.missing_keys:
+            logger.warning(
+                "Vocoder missing keys (%d): %s",
+                len(_load_result.missing_keys),
+                _load_result.missing_keys[:10],
+            )
+        if _load_result.unexpected_keys:
+            logger.warning(
+                "Vocoder unexpected keys (%d): %s",
+                len(_load_result.unexpected_keys),
+                _load_result.unexpected_keys[:10],
+            )
+
         self.speaker_embed.load_state_dict(
             _deparametrize_state_dict(ckpt["speaker_embed"]))
-        logger.info("Loaded flow + vocoder + speaker_embed from checkpoint")
+        _ema_label = "EMA" if "flow_ema" in ckpt else "raw (no EMA in checkpoint)"
+        logger.info(f"Loaded flow + vocoder ({_ema_label}) + speaker_embed from checkpoint")
 
         # FAISS index (optional)
         self.faiss_index = None
