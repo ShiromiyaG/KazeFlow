@@ -27,8 +27,11 @@ _ROOT = Path(__file__).parent.parent.parent  # kazeflow/preprocess/ -> kazeflow/
 _CONFIGS_DIR = _ROOT / "kazeflow" / "configs"
 _LOGS_DIR = _ROOT / "logs"
 
-# KazeFlow uses a single embedder (SPIN v2), so there is one mute folder.
-_MUTE_DIR = _LOGS_DIR / "mute_spin_v2"
+# KazeFlow mute directories — must match the embedder used in preprocessing.
+_MUTE_DIRS = {
+    "spin_v2": _LOGS_DIR / "mute_spin_v2",
+    "rspin":   _LOGS_DIR / "mute_rspin",
+}
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -66,6 +69,7 @@ def generate_filelist(
     model_path: str,
     sample_rate: int,
     include_mutes: int = 2,
+    content_embedder: str = "spin_v2",
 ) -> None:
     """
     Build filelist.txt from the intersection of feature directories and optionally
@@ -74,7 +78,7 @@ def generate_filelist(
     KazeFlow directory layout expected under *model_path*:
 
         sliced_audios/   *.wav    (GT audio)
-        spin/            *.npy    (SPIN v2 embeddings, shape [T, 768])
+        spin/            *.npy    (content embeddings)
         f0/              *.npy    (F0 contours, shape [T,] float64 Hz)
         mel/             *.npy    (log mel, shape [n_mels, T])
 
@@ -86,7 +90,7 @@ def generate_filelist(
     The ``|``-separated speaker ID is extracted from the stem prefix.
 
     Mute entries are appended *include_mutes* times per speaker and point to
-    ``logs/mute_spin_v2/`` pre-generated mute files.
+    the mute directory matching the configured content_embedder.
 
     Args:
         model_path:    Experiment directory (e.g. "logs/my_model").
@@ -139,10 +143,11 @@ def generate_filelist(
 
     # ── Append mute entries ───────────────────────────────────────────────
     if include_mutes > 0:
-        mute_wav = _MUTE_DIR / "sliced_audios" / f"mute{sample_rate}.wav"
-        mute_spin = _MUTE_DIR / "spin" / "mute.npy"
-        mute_f0 = _MUTE_DIR / "f0" / "mute.npy"
-        mute_mel = _MUTE_DIR / "mel" / "mute.npy"
+        _mute_dir = _MUTE_DIRS.get(content_embedder, _MUTE_DIRS["spin_v2"])
+        mute_wav = _mute_dir / "sliced_audios" / f"mute{sample_rate}.wav"
+        mute_spin = _mute_dir / "spin" / "mute.npy"
+        mute_f0 = _mute_dir / "f0" / "mute.npy"
+        mute_mel = _mute_dir / "mel" / "mute.npy"
 
         missing_mutes = [
             p for p in (mute_wav, mute_spin, mute_f0, mute_mel) if not p.exists()

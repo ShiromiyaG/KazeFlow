@@ -6,8 +6,8 @@
     "n_fft": 2048,
     "win_length": 2048,
     "n_mels": 128,
-    "segment_size": 46080,
-    "segment_frames": 96,
+    "segment_size": 23040,
+    "segment_frames": 48,
     "flow_matching": {
       "mel_channels": 128,
       "hidden_channels": 256,

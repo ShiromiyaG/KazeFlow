@@ -24,6 +24,10 @@ import torch.nn.functional as F
 # division-by-zero / log-of-zero in mixed-precision training.
 _EPS = 1e-4
 
+# Mel log-floor: must match preprocessing (1e-5) so the vocoder loss
+# sees the same dynamic range as the stored training mels.
+_MEL_EPS = 1e-5
+
 
 @torch.amp.autocast("cuda", enabled=False)
 def mel_spectrogram_loss(y: torch.Tensor, y_hat: torch.Tensor,
@@ -68,7 +72,7 @@ def _mel_spec(x: torch.Tensor, n_fft: int, hop_length: int,
         ).T.to(x.device)  # (n_mels, n_fft//2+1)
 
     mel = torch.matmul(mel_basis, mag)
-    log_mel = torch.log(torch.clamp(mel, min=_EPS))
+    log_mel = torch.log(torch.clamp(mel, min=_MEL_EPS))
     return log_mel
 
 

@@ -286,6 +286,7 @@ class PreprocessPipeline:
             model_path=str(output_dir),
             sample_rate=self.sample_rate,
             include_mutes=2,
+            content_embedder=self.content_embedder_name,
         )
 
     def _process_single(self, audio_path: Path, output_dir: Path,
