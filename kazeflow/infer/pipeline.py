@@ -446,6 +446,10 @@ class KazeFlowPipeline:
         logger.info("Energy-gated SPIN: %.1f%% frames silenced (gate<0.1)",
                      100 * (gate < 0.1).float().mean().item())
 
+        # Keep source energy for DirectMelPredictor conditioning.
+        # mel_for_gate is (1, n_mels, T_mel); mean across freq → (1, 1, T_mel).
+        _source_energy = mel_for_gate.mean(dim=1, keepdim=True)
+
         del mel_for_gate, mel_energy, gate
 
         # Free feature extraction models from GPU
@@ -490,12 +494,19 @@ class KazeFlowPipeline:
 
         # Generate mel from conditioning
         if self.architecture == "direct_mel":
+            # Interpolate source energy to match aligned frame count
+            if _source_energy.shape[2] != min_len:
+                _source_energy = F.interpolate(
+                    _source_energy, size=min_len,
+                    mode="linear", align_corners=False,
+                )
             # Direct mel regression: single deterministic forward pass
             mel_hat = self.flow.sample(
                 content=spin_features,
                 f0=f0,
                 x_mask=x_mask,
                 g=g,
+                energy=_source_energy,
             )
         else:
             # Flow matching: ODE solver

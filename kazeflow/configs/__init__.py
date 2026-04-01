@@ -12,6 +12,7 @@ and returns a complete, ready-to-use config dict.
 
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,15 @@ _SR_MAP = {
     44100: "44k",
     48000: "48k",
 }
+
+# Mapping from content_embedder name → expected cond_channels.
+# Imported lazily to avoid circular deps; kept here as a fallback.
+_EMBEDDER_DIMS = {
+    "spin_v2": 768,
+    "rspin": 256,
+}
+
+_logger = logging.getLogger(__name__)
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -101,4 +111,24 @@ def load_config(
         raise ValueError(f"Unknown preset '{preset}'. Available: pretrain")
 
     # 4) Vocoder type overlay — load per-type vocoder & discriminator configs
-    return apply_vocoder_overlay(config, vocoder_type)
+    config = apply_vocoder_overlay(config, vocoder_type)
+
+    # 5) Auto-reconcile cond_channels with content_embedder.
+    # The content_embedder setting (in preprocess) determines the
+    # actual dimensionality of content features fed to the flow model.
+    # If cond_channels disagrees, fix it — a silent shape mismatch
+    # would cause a cryptic runtime crash or, worse, a learned 1×1
+    # conv that maps 256→768 by projecting through a broken identity.
+    embedder_name = config.get("preprocess", {}).get("content_embedder")
+    if embedder_name and embedder_name in _EMBEDDER_DIMS:
+        expected_dim = _EMBEDDER_DIMS[embedder_name]
+        flow_cfg = config.get("model", {}).get("flow_matching", {})
+        current_dim = flow_cfg.get("cond_channels")
+        if current_dim is not None and current_dim != expected_dim:
+            _logger.warning(
+                "Auto-fixing cond_channels: %d → %d (content_embedder=%r)",
+                current_dim, expected_dim, embedder_name,
+            )
+            config["model"]["flow_matching"]["cond_channels"] = expected_dim
+
+    return config

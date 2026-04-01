@@ -106,8 +106,35 @@ class F0Conditioning(nn.Module):
         # f0: (B, 1, T)
         voiced = (f0 > 0).long().squeeze(1)            # (B, T)
         uv = self.uv_embed(voiced).transpose(1, 2)     # (B, H/2, T)
-        f0_cont = self.voiced_proj(f0.clamp(min=0))    # (B, H/2, T)
+        # Log-scale F0: pitch perception is logarithmic.  Raw Hz values
+        # span 50-1600+ Hz — a linear projection can't capture octave
+        # structure.  log(Hz) makes semitone distances uniform.
+        f0_log = torch.where(f0 > 0, torch.log(f0.clamp(min=1.0)), torch.zeros_like(f0))
+        f0_cont = self.voiced_proj(f0_log)              # (B, H/2, T)
         return self.out_proj(torch.cat([f0_cont, uv], dim=1))
+
+
+class EnergyConditioning(nn.Module):
+    """
+    Frame-level energy conditioning.
+
+    SPIN features are energy-gated (zeroed in silence) and RSPIN
+    features are L2-normalized — both strip loudness information.
+    This module provides the model with an explicit energy signal
+    so it can reproduce dynamics (loud vs. soft passages).
+    """
+
+    def __init__(self, hidden_channels: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv1d(1, hidden_channels, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(hidden_channels, hidden_channels, 1),
+        )
+
+    def forward(self, energy: torch.Tensor) -> torch.Tensor:
+        # energy: (B, 1, T) — mean log-mel energy per frame
+        return self.proj(energy)
 
 
 class Snake(nn.Module):
@@ -159,6 +186,7 @@ class MelEstimator(nn.Module):
         n_layers: int = 12,
         kernel_size: int = 7,
         dilation_rate: int = 2,
+        dilation_cycle: int = 4,
         dropout: float = 0.05,
         use_checkpoint: bool = False,
     ):
@@ -178,6 +206,9 @@ class MelEstimator(nn.Module):
         # Dedicated F0 conditioning (voiced/unvoiced aware)
         self.f0_cond = F0Conditioning(hidden_channels)
 
+        # Energy conditioning (loudness contour)
+        self.energy_cond = EnergyConditioning(hidden_channels)
+
         # Content projection: content features -> hidden (no F0 concat)
         self.cond_proj = nn.Conv1d(cond_channels, hidden_channels, 1)
 
@@ -191,10 +222,13 @@ class MelEstimator(nn.Module):
             torch.full((1, hidden_channels, 1), _inv.item())
         )
 
-        # Gated DS conv blocks with exponential dilations
+        # Gated DS conv blocks with exponential dilations.
+        # Cycle length caps max dilation so no layer's receptive field
+        # exceeds the training segment length.  cycle=4 with rate=2
+        # gives dilations [1, 2, 4, 8] — max single-layer RF = 49.
         self.blocks = nn.ModuleList()
         for i in range(n_layers):
-            dilation = dilation_rate ** (i % 8)
+            dilation = dilation_rate ** (i % dilation_cycle)
             self.blocks.append(GatedDSConvBlockDM(
                 hidden_channels, spk_dim, kernel_size, dilation, dropout,
             ))
@@ -215,6 +249,7 @@ class MelEstimator(nn.Module):
         f0: torch.Tensor,          # (B, 1, T)
         x_mask: torch.Tensor,      # (B, 1, T)
         g: Optional[torch.Tensor] = None,  # (B, gin_ch, 1) speaker
+        energy: Optional[torch.Tensor] = None,  # (B, 1, T) frame energy
     ) -> torch.Tensor:
         # Speaker conditioning -> (B, spk_dim)
         if g is not None and self.spk_proj is not None:
@@ -228,6 +263,10 @@ class MelEstimator(nn.Module):
         # Content + dedicated F0 embedding (additive, not concat)
         f0_feat = self.f0_cond(f0)                     # (B, H, T)
         h = self.cond_proj(content) + f0_feat           # (B, H, T)
+
+        # Energy conditioning: provides loudness contour
+        if energy is not None:
+            h = h + self.energy_cond(energy)
 
         # Stochastic bottleneck: inject learnable noise during training
         if self.training:
@@ -278,6 +317,7 @@ class DirectMelPredictor(nn.Module):
         n_layers: int = 12,
         kernel_size: int = 7,
         dilation_rate: int = 2,
+        dilation_cycle: int = 4,
         dropout: float = 0.05,
         use_checkpoint: bool = False,
         # Unused CFM params — accepted for config compatibility
@@ -296,6 +336,7 @@ class DirectMelPredictor(nn.Module):
             n_layers=n_layers,
             kernel_size=kernel_size,
             dilation_rate=dilation_rate,
+            dilation_cycle=dilation_cycle,
             dropout=dropout,
             use_checkpoint=use_checkpoint,
         )
@@ -306,9 +347,10 @@ class DirectMelPredictor(nn.Module):
         f0: torch.Tensor,
         x_mask: torch.Tensor,
         g: Optional[torch.Tensor] = None,
+        energy: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return mel prediction WITH gradients (for adversarial training)."""
-        return self.estimator(content, f0, x_mask, g)
+        return self.estimator(content, f0, x_mask, g, energy=energy)
 
     def forward(
         self,
@@ -317,9 +359,10 @@ class DirectMelPredictor(nn.Module):
         content: torch.Tensor,      # (B, cond_ch, T)
         f0: torch.Tensor,           # (B, 1, T)
         g: Optional[torch.Tensor] = None,
+        energy: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Training forward: compute L1 mel prediction loss."""
-        mel_hat = self.estimator(content, f0, x_mask, g)
+        mel_hat = self.estimator(content, f0, x_mask, g, energy=energy)
 
         # L1 loss — compute in fp32 to avoid sum overflow in fp16
         C = x_1.shape[1]
@@ -334,6 +377,7 @@ class DirectMelPredictor(nn.Module):
         f0: torch.Tensor,
         x_mask: torch.Tensor,
         g: Optional[torch.Tensor] = None,
+        energy: Optional[torch.Tensor] = None,
         # Unused ODE params — accepted for interface compatibility
         n_steps: int = 16,
         method: str = "euler",
@@ -346,4 +390,4 @@ class DirectMelPredictor(nn.Module):
         for drop-in compatibility.  n_steps, method, and guidance_scale
         are ignored (no ODE, deterministic output).
         """
-        return self.estimator(content, f0, x_mask, g)
+        return self.estimator(content, f0, x_mask, g, energy=energy)

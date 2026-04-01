@@ -539,9 +539,10 @@ class KazeFlowPretrainer:
 
             infer_cfg = self.config.get("inference", {})
             if self.architecture == "direct_mel":
+                _energy = mel_ref.mean(dim=1, keepdim=True)
                 mel_hat = ema_flow.sample(
                     content=spin_ref, f0=f0_expanded,
-                    x_mask=x_mask, g=g,
+                    x_mask=x_mask, g=g, energy=_energy,
                 )
                 ode_steps = 1
             else:
@@ -813,6 +814,9 @@ class KazeFlowPretrainer:
                 x_mask = torch.ones(B, 1, T, device=self.device)
                 f0_expanded = f0.unsqueeze(1)
 
+                # Frame-level energy for DirectMelPredictor conditioning
+                _energy = mel.mean(dim=1, keepdim=True) if _is_direct_mel else None
+
                 # ── CFM / Direct Mel Loss ─────────────────────────────
                 # Gradient accumulation: zero_grad only at start of window
                 if _accum_cfm == 0:
@@ -830,7 +834,7 @@ class KazeFlowPretrainer:
                     with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                         _mel_hat_adv = self.flow.predict(
                             content=spin, f0=f0_expanded,
-                            x_mask=x_mask, g=g,
+                            x_mask=x_mask, g=g, energy=_energy,
                         )
                         # L1 in fp32 to avoid sum overflow in fp16
                         _C = mel.shape[1]
@@ -874,7 +878,7 @@ class KazeFlowPretrainer:
                     with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                         _mel_hat_adv = self.flow.predict(
                             content=spin, f0=f0_expanded,
-                            x_mask=x_mask, g=g,
+                            x_mask=x_mask, g=g, energy=_energy,
                         )
                         _C = mel.shape[1]
                         _err = ((_mel_hat_adv - mel) * x_mask).float()
@@ -951,7 +955,7 @@ class KazeFlowPretrainer:
                                                     dtype=self.amp_dtype):
                                 mel_hat = self.flow.predict(
                                     content=spin, f0=f0_expanded,
-                                    x_mask=x_mask, g=g,
+                                    x_mask=x_mask, g=g, energy=_energy,
                                 )
                         _voc_input_mel = mel_hat  # connected graph
                     else:
@@ -964,11 +968,17 @@ class KazeFlowPretrainer:
                             with torch.no_grad():
                                 mel_hat = self.flow.sample(
                                     content=spin, f0=f0_expanded,
-                                    x_mask=x_mask, g=g,
+                                    x_mask=x_mask, g=g, energy=_energy,
                                 )
                             self.flow.train()
-                        # Direct mel: always feed GT mel to vocoder (no cascaded error)
-                        _voc_input_mel = mel.detach()
+                        # GT mel mixing: with probability gt_mel_ratio, feed GT mel
+                        # to the vocoder; otherwise feed the predicted mel.  This
+                        # exposes the vocoder to predicted-mel distribution during
+                        # training, closing the train/inference gap that causes
+                        # poor audio quality (especially on music vocals).
+                        _gt_mel_ratio = train_cfg.get("gt_mel_ratio", 0.0)
+                        _use_gt = _gt_mel_ratio > 0 and _random.random() < _gt_mel_ratio
+                        _voc_input_mel = mel.detach() if _use_gt else mel_hat.detach()
                     _ode_n = 1  # for logging
                     # Free mel disc intermediates before vocoder step
                     del _mel_hat_adv, _md_rs, _md_gs
