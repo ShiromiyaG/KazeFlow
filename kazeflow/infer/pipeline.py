@@ -540,11 +540,49 @@ class KazeFlowPipeline:
         T_mel = mel_hat.shape[2]
 
         if self.architecture == "direct_mel":
-            # Direct mel: single-pass vocoder (no chunking), matching RVC
-            # behaviour.  The vocoder is fully convolutional and handles
-            # arbitrary lengths; chunking only introduces crossfade
-            # artefacts at chunk boundaries.
-            waveform = self.vocoder(mel_hat, f0_squeezed, g=g)
+            # Direct mel: chunk long audio to avoid VRAM OOM on modest GPUs.
+            _chunk_frames = 600   # ~6s at 100Hz frame rate
+            _overlap_frames = 16  # overlap for smooth crossfade
+
+            if T_mel <= _chunk_frames:
+                waveform = self.vocoder(mel_hat, f0_squeezed, g=g)
+            else:
+                _stride = _chunk_frames - _overlap_frames
+                _hop = self.hop_length
+                _xfade_samples = _overlap_frames * _hop
+                wav_chunks = []
+                prev_overlap = None
+
+                pos = 0
+                while pos < T_mel:
+                    end = min(pos + _chunk_frames, T_mel)
+                    mel_chunk = mel_hat[:, :, pos:end]
+                    f0_chunk = f0_squeezed[:, pos:end]
+
+                    wav_chunk = self.vocoder(mel_chunk, f0_chunk, g=g)
+                    wav_chunk = wav_chunk.float().squeeze(0).squeeze(0)
+
+                    if prev_overlap is not None:
+                        cur_head = wav_chunk[:_xfade_samples]
+                        fade_in = torch.linspace(0, 1, _xfade_samples, device=wav_chunk.device)
+                        blended = prev_overlap * (1 - fade_in) + cur_head * fade_in
+                        wav_chunks.append(blended)
+                        body_start = _xfade_samples
+                    else:
+                        body_start = 0
+
+                    if end < T_mel:
+                        prev_overlap = wav_chunk[-_xfade_samples:].clone()
+                        wav_chunks.append(wav_chunk[body_start:-_xfade_samples])
+                    else:
+                        wav_chunks.append(wav_chunk[body_start:])
+                        prev_overlap = None
+
+                    pos += _stride
+                    del mel_chunk, f0_chunk, wav_chunk
+                    torch.cuda.empty_cache()
+
+                waveform = torch.cat(wav_chunks, dim=0).unsqueeze(0)
         else:
             # CFM: chunked vocoder for long audio to manage VRAM after
             # the ODE solver has already consumed a significant amount.

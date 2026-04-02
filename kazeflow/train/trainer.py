@@ -44,6 +44,7 @@ from kazeflow.train.losses import (
     discriminator_loss_lsgan,
     discriminator_loss_hinge,
     discriminator_loss_softplus,
+    envelope_loss,
     feature_loss,
     generator_loss_lsgan,
     generator_loss_hinge,
@@ -51,6 +52,7 @@ from kazeflow.train.losses import (
     mel_spectrogram_loss,
     mel_spectral_convergence_loss,
     multi_resolution_stft_loss,
+    phase_continuity_loss,
     r1_gradient_penalty,
 )
 
@@ -457,6 +459,8 @@ class KazeFlowTrainer:
         self.grad_clip_disc = train_cfg["grad_clip_disc"]
         self.c_lecam = train_cfg.get("c_lecam", 0.0)
         self.lecam = LeCamEMA(decay=train_cfg.get("lecam_ema_decay", 0.999)) if self.c_lecam > 0 else None
+        self.c_env = train_cfg.get("c_env", 0.0)
+        self.c_phase = train_cfg.get("c_phase", 0.0)
         self.cfm_grad_accum = max(1, int(train_cfg.get("cfm_grad_accum", 1)))
 
         # ── Gradient Balancer (EnCodec-style) ────────────────────────
@@ -657,6 +661,11 @@ class KazeFlowTrainer:
         logger.info(f"Batch size: {train_cfg['batch_size']}")
 
         _e2e_lr_applied = False
+        _freeze_vocoder = train_cfg.get("freeze_vocoder", False)
+        if _freeze_vocoder:
+            self._unwrap_model(self.vocoder).requires_grad_(False)
+            self._unwrap_model(self.discriminator).requires_grad_(False)
+            logger.info("freeze_vocoder=True: vocoder & discriminator frozen (pretrain weights preserved)")
 
         for epoch in range(self.epoch, epochs):
             # Check stop signal before starting a new epoch
@@ -859,6 +868,34 @@ class KazeFlowTrainer:
                         self.ema_flow.update()
                         _accum_cfm = 0
 
+                # ── Skip vocoder training when frozen ────────────
+                if _freeze_vocoder and not in_e2e:
+                    if not in_e2e and _do_flow_step:
+                        self.scaler_flow.update()
+                    self.global_step += 1
+                    # Defaults for logging
+                    loss_mel = loss_gen = loss_fm = loss_disc = torch.tensor(0.0)
+                    loss_mrstft = loss_env = loss_phase = torch.tensor(0.0)
+                    loss_voc_total = torch.tensor(0.0)
+                    loss_lecam = torch.tensor(0.0)
+                    gn_disc = gn_voc = None
+                    d_real_mean = d_fake_mean = 0.0
+                    _apply_r1 = False
+                    _ode_n = 1
+                    pbar.set_postfix(flow=f"{loss_cfm.item():.4f}", voc="frozen")
+                    if self.global_step % log_every == 0:
+                        self.writer.add_scalar("loss/flow", loss_cfm.item(), self.global_step)
+                        self.writer.add_scalar("grad_norm/flow", _gn_flow.item(), self.global_step)
+                        self.writer.add_scalar("lr/flow", self.optim_flow.param_groups[0]["lr"], self.global_step)
+                        if self.mel_disc is not None:
+                            self.writer.add_scalar("loss/mel_disc", _loss_mel_disc.item(), self.global_step)
+                            self.writer.add_scalar("loss/mel_gen", _loss_mel_gen.item(), self.global_step)
+                            self.writer.add_scalar("loss/mel_fm", _loss_mel_fm_val.item(), self.global_step)
+                            self.writer.add_scalar("loss/mel_sc", _loss_mel_sc.item(), self.global_step)
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    continue
+
                 # ── Step 2: Generate mel from flow (for vocoder) ─────
                 _train_cfg = self.config["train"]
                 if _is_direct_mel:
@@ -876,25 +913,13 @@ class KazeFlowTrainer:
                                 )
                         _voc_input_mel = mel_hat  # connected graph
                     else:
-                        # Reuse mel prediction from adversarial step if available
-                        if _mel_hat_adv is not None:
-                            mel_hat = _mel_hat_adv.detach()
-                        else:
-                            self.flow.eval()
-                            with torch.no_grad():
-                                mel_hat = self.flow.sample(
-                                    content=spin, f0=f0_expanded,
-                                    x_mask=x_mask, g=g, energy=_energy,
-                                )
-                            self.flow.train()
-                        # GT mel mixing: with probability gt_mel_ratio, feed GT mel
-                        # to the vocoder; otherwise feed the predicted mel.  This
-                        # exposes the vocoder to predicted-mel distribution during
-                        # training, closing the train/inference gap that causes
-                        # poor audio quality (especially on music vocals).
-                        _gt_mel_ratio = _train_cfg.get("gt_mel_ratio", 0.0)
-                        _use_gt = _gt_mel_ratio > 0 and _random.random() < _gt_mel_ratio
-                        _voc_input_mel = mel.detach() if _use_gt else mel_hat.detach()
+                        # ── Structural fix: vocoder always trains on GT mel ──
+                        # Like VITS's posterior encoder, the vocoder receives
+                        # clean input so it finetunes without adversarial
+                        # degradation.  The mel predictor trains separately
+                        # via L1 + mel disc losses (mel-space only).
+                        # The E2E phase later closes the train/inference gap.
+                        _voc_input_mel = mel.detach()
                     _ode_n = 1
                     # Free mel disc intermediates before vocoder step
                     del _mel_hat_adv, _md_rs, _md_gs
@@ -1012,11 +1037,24 @@ class KazeFlowTrainer:
                     loss_mrstft = multi_resolution_stft_loss(
                         wav_real_detached, wav_hat)
 
+                loss_env = torch.tensor(0.0, device=self.device)
+                if self.c_env > 0:
+                    loss_env = envelope_loss(wav_real_detached, wav_hat)
+
+                loss_phase = torch.tensor(0.0, device=self.device)
+                if self.c_phase > 0:
+                    loss_phase = phase_continuity_loss(
+                        wav_real_detached, wav_hat,
+                        n_fft=self.config["model"]["n_fft"],
+                        hop_length=self.hop_length,
+                        win_length=self.config["model"]["win_length"],
+                    )
+
                 # NaN guard for vocoder losses
-                voc_losses = [loss_gen, loss_fm, loss_mel, loss_mrstft]
+                voc_losses = [loss_gen, loss_fm, loss_mel, loss_mrstft, loss_env, loss_phase]
                 if not all(torch.isfinite(l) for l in voc_losses):
                     bad = [n for n, l in zip(
-                        ["gen", "fm", "mel", "mrstft"], voc_losses
+                        ["gen", "fm", "mel", "mrstft", "env", "phase"], voc_losses
                     ) if not torch.isfinite(l)]
                     logger.warning(
                         f"Step {self.global_step}: NaN/inf in vocoder losses "
@@ -1035,6 +1073,8 @@ class KazeFlowTrainer:
                             + self.c_fm * loss_fm
                             + self.c_mel * loss_mel
                             + self.c_mrstft * loss_mrstft
+                            + self.c_env * loss_env
+                            + self.c_phase * loss_phase
                         )
                         _c_e2e = _train_cfg.get("c_e2e_wav", 0.1)
                         loss_e2e = loss_cfm + _c_e2e * loss_voc_total
@@ -1053,6 +1093,8 @@ class KazeFlowTrainer:
                             "fm": loss_fm,
                             "mel": loss_mel,
                             "mrstft": loss_mrstft,
+                            "env": loss_env,
+                            "phase": loss_phase,
                         }
                         # Pick a reference param for gradient norm measurement
                         _ref_param = next(self.vocoder.parameters())
@@ -1073,6 +1115,8 @@ class KazeFlowTrainer:
                             + self.c_fm * loss_fm
                             + self.c_mel * loss_mel
                             + self.c_mrstft * loss_mrstft
+                            + self.c_env * loss_env
+                            + self.c_phase * loss_phase
                         )
                         self.scaler_gen.scale(loss_voc_total).backward()
                         self.scaler_gen.unscale_(self.optim_vocoder)
@@ -1104,6 +1148,10 @@ class KazeFlowTrainer:
                     self.writer.add_scalar("loss/mel", loss_mel.item(), step)
                     if self.c_mrstft > 0:
                         self.writer.add_scalar("loss/mrstft", loss_mrstft.item(), step)
+                    if self.c_env > 0:
+                        self.writer.add_scalar("loss/env", loss_env.item(), step)
+                    if self.c_phase > 0:
+                        self.writer.add_scalar("loss/phase", loss_phase.item(), step)
                     if gn_voc is not None:  # loss_voc_total only exists when step succeeded
                         self.writer.add_scalar("loss/voc_total", loss_voc_total.item(), step)
                     # Discriminator health
