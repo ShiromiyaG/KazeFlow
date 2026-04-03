@@ -913,13 +913,22 @@ class KazeFlowTrainer:
                                 )
                         _voc_input_mel = mel_hat  # connected graph
                     else:
-                        # ── Structural fix: vocoder always trains on GT mel ──
-                        # Like VITS's posterior encoder, the vocoder receives
-                        # clean input so it finetunes without adversarial
-                        # degradation.  The mel predictor trains separately
-                        # via L1 + mel disc losses (mel-space only).
-                        # The E2E phase later closes the train/inference gap.
-                        _voc_input_mel = mel.detach()
+                        # Reuse mel prediction from adversarial step if available
+                        if _mel_hat_adv is not None:
+                            mel_hat = _mel_hat_adv.detach()
+                        else:
+                            self.flow.eval()
+                            with torch.no_grad():
+                                mel_hat = self.flow.predict(
+                                    content=spin, f0=f0_expanded,
+                                    x_mask=x_mask, g=g, energy=_energy,
+                                )
+                            self.flow.train()
+                        # GT mel mixing: with probability gt_mel_ratio, feed GT mel
+                        # to the vocoder so it also trains on clean targets.
+                        _gt_mel_ratio = _train_cfg.get("gt_mel_ratio", 0.0)
+                        _use_gt = _gt_mel_ratio > 0 and _random.random() < _gt_mel_ratio
+                        _voc_input_mel = mel.detach() if _use_gt else mel_hat.detach()
                     _ode_n = 1
                     # Free mel disc intermediates before vocoder step
                     del _mel_hat_adv, _md_rs, _md_gs
@@ -960,6 +969,20 @@ class KazeFlowTrainer:
                     target_len = min(wav_hat.shape[-1], wav_gt.shape[-1])
                     wav_hat = wav_hat[..., :target_len]
                     wav_real_detached = wav_gt[..., :target_len].detach()
+
+                # ── Level normalization ──────────────────────────────
+                # The soft clipping x/(1+|x|) asymptotes to ±1 so the vocoder
+                # can never reach the GT peak of 0.95.  Without rescaling, every
+                # loss (mel, STFT, envelope, discriminator) creates constant
+                # pressure to amplify, driving the vocoder deep into the
+                # saturation zone and causing pervasive distortion ("estourado").
+                # Fix: rescale GT waveform per-sample to match the vocoder's
+                # actual peak so losses focus on waveform shape, not amplitude.
+                with torch.no_grad():
+                    _hat_peak = wav_hat.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+                    _gt_peak = wav_real_detached.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+                    _level_scale = (_hat_peak / _gt_peak).clamp(0.5, 1.0)
+                    wav_real_detached = wav_real_detached * _level_scale
 
                 # ── Step 4: Discriminator — repeated n_disc_steps times per gen step
                 gn_disc = None
