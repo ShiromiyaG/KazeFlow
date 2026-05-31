@@ -164,7 +164,7 @@ def run_feature_extraction(
     model_name: str,
     sample_rate: int,
     content_embedder: str = "rspin",
-    architecture: str = "cfm",
+    architecture: str = "rfm",  # Always RFM
 ):
     """Stage 2: Extract embeddings, pitch, mel. Deletes existing features to redo."""
     global _training_status
@@ -265,12 +265,10 @@ def start_training(
     batch_size: int,
     save_every: int,
     epochs: int,
-    e2e_epochs_val: int,
     pretrain_path: str,
     resume_path: str,
     content_embedder: str,
     vocoder_type: str,
-    architecture: str,
     # Advanced
     precision: str,
     torch_compile: bool,
@@ -323,7 +321,8 @@ def start_training(
             config["train"]["use_gradient_balancer"] = gradient_balancer
             config["preprocess"]["content_embedder"] = content_embedder
 
-            config["model"]["architecture"] = architecture
+            # Force RFM architecture
+            config["model"]["architecture"] = "rfm"
 
             from kazeflow.models.embedder import EMBEDDER_DIMS
             config["model"]["flow_matching"]["cond_channels"] = EMBEDDER_DIMS[content_embedder]
@@ -334,9 +333,6 @@ def start_training(
                 config["train"]["save_every"] = save_every
             if epochs > 0:
                 config["train"]["epochs"] = epochs
-
-            if e2e_epochs_val > 0:
-                config["train"]["e2e_epochs"] = int(e2e_epochs_val)
 
             import torch
             from kazeflow.train.trainer import KazeFlowTrainer
@@ -428,15 +424,10 @@ def create_training_tab():
                     value="chouwa_gan",
                     info="ChouwaGAN: HiFi-GAN backbone with SAN discriminator, anti-aliased activations and harmonic prior.",
                 )
-            architecture = gr.Radio(
-                    label="Architecture",
-                    choices=[
-                        ("Flow Matching (CFM)", "cfm"),
-                        ("Direct Mel Regression", "direct_mel"),
-                    ],
-                    value="cfm",
-                    info="CFM: ODE-based generative model. Direct Mel: simpler, faster, deterministic — no ODE.",
-                )
+            # Architecture is fixed to RFM — no selector needed
+            gr.Markdown(
+                "> **Architecture:** Rectified Flow Matching (RFM) — the only supported model.")
+
 
         # ── 1. Preprocess Audio ──────────────────────────────────────────
         with gr.Accordion("1 · Preprocess Audio", open=True):
@@ -536,10 +527,6 @@ def create_training_tab():
                     training_epochs = gr.Number(
                         label="Total Epochs", value=500, precision=0, minimum=0,
                         info="0 = config default",
-                    )
-                    e2e_epochs = gr.Number(
-                        label="E2E Epochs", value=0, precision=0, minimum=0,
-                        info="End-to-end fine-tune: wav loss → flow. 0 = off. DirectMel only.",
                     )
 
             with gr.Group():
@@ -662,15 +649,15 @@ def create_training_tab():
         )
         extract_btn.click(
             fn=run_feature_extraction,
-            inputs=[model_name, sample_rate, content_embedder, architecture],
+            inputs=[model_name, sample_rate, content_embedder],
             outputs=[extract_status],
         )
         train_btn.click(
             fn=start_training,
             inputs=[model_name, sample_rate,
                     batch_size, save_every, training_epochs,
-                    e2e_epochs, pretrain_ckpt, resume_ckpt, content_embedder,
-                    vocoder_type, architecture,
+                    pretrain_ckpt, resume_ckpt, content_embedder,
+                    vocoder_type,
                     # Advanced
                     precision, torch_compile, compile_mode,
                     lr_scheduler, gan_loss_type,

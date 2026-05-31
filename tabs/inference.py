@@ -1,4 +1,9 @@
-"""KazeFlow - Inference Tab."""
+"""KazeFlow - Inference Tab.
+
+Loads a checkpoint and its accompanying config.json (if present) to
+auto-populate inference parameters (ODE steps, method, guidance scale, etc.)
+with the values used during training.
+"""
 
 import json
 import logging
@@ -23,16 +28,24 @@ _LOGS_DIR = _NOW_DIR / "logs"
 
 _SUPPORTED_AUDIO = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac"}
 
+# Defaults that mirror base.json ["inference"]
+_INFER_DEFAULTS = {
+    "ode_steps": 4,
+    "ode_method": "midpoint",
+    "guidance_scale": 1.5,
+    "f0_method": "rmvpe",
+    "f0_shift": 0,
+    "index_rate": 0.0,
+}
+
 
 def get_available_models() -> list:
-    """List available model checkpoints from assets/checkpoints/."""
+    """List available model checkpoints from assets/checkpoints/ and logs/."""
     results = []
-    # Search assets/checkpoints/ for *.pt files
     for root, _, files in os.walk(_MODELS_DIR):
         for f in sorted(files):
             if f.endswith(".pt"):
                 results.append(os.path.relpath(os.path.join(root, f), _NOW_DIR))
-    # Also search logs/ for *.pt files (trained checkpoints saved there)
     for root, _, files in os.walk(_LOGS_DIR):
         for f in sorted(files):
             if f.endswith(".pt") and not f.startswith(("G_", "D_")):
@@ -64,12 +77,10 @@ def get_speakers_id(model_path: str) -> list:
     try:
         import torch
         ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-        # Check metadata stored in checkpoint
         if isinstance(ckpt, dict):
             n = ckpt.get("n_speakers") or ckpt.get("speakers_id")
             if n and int(n) > 0:
                 return list(range(int(n)))
-            # Try reading from speaker_embed weight shape
             state = ckpt.get("generator") or ckpt.get("model") or ckpt
             if isinstance(state, dict):
                 for key in ("speaker_embed.weight", "speaker_embedding.weight"):
@@ -77,7 +88,6 @@ def get_speakers_id(model_path: str) -> list:
                         return list(range(state[key].shape[0]))
     except Exception:
         pass
-    # Fallback: look for model_info.json in the same dir or logs/<name>/
     model_p = Path(model_path)
     for info_path in [
         model_p.parent / "model_info.json",
@@ -94,17 +104,46 @@ def get_speakers_id(model_path: str) -> list:
     return [0]
 
 
+def _load_infer_config(model_path: str) -> dict:
+    """
+    Read the config.json next to the checkpoint and return the [inference]
+    section merged with _INFER_DEFAULTS (checkpoint config takes priority).
+    Falls back to _INFER_DEFAULTS if no config.json is found.
+    """
+    cfg = dict(_INFER_DEFAULTS)
+    if not model_path:
+        return cfg
+
+    model_p = Path(model_path)
+    # Candidates: same dir as checkpoint, or logs/<stem>/
+    candidates = [
+        model_p.parent / "config.json",
+        _LOGS_DIR / model_p.stem / "config.json",
+        _LOGS_DIR / model_p.parent.name / "config.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                with open(p) as f:
+                    full_cfg = json.load(f)
+                infer_cfg = full_cfg.get("inference", {})
+                cfg.update({k: v for k, v in infer_cfg.items() if k in cfg})
+                logger.info("Loaded inference config from %s", p)
+                break
+            except Exception as e:
+                logger.warning("Could not read config %s: %s", p, e)
+    return cfg
+
+
 def match_index(model_path: str) -> str:
     """Try to auto-match an index file to the selected model."""
     if not model_path:
         return ""
     model_stem = Path(model_path).stem
     all_indexes = get_available_indexes()
-    # Exact stem match
     for idx in all_indexes:
         if Path(idx).stem == model_stem:
             return idx
-    # Partial stem match
     for idx in all_indexes:
         if model_stem in Path(idx).stem or Path(idx).stem in model_stem:
             return idx
@@ -116,10 +155,8 @@ def refresh_all(model_path: str, index_path_current: str):
     models = get_available_models()
     indexes = get_available_indexes()
 
-    # Keep current model only if file still exists in the list
     valid_model = model_path if model_path in models else None
 
-    # Keep current index only if file still exists; otherwise try to auto-match
     if index_path_current and index_path_current in indexes:
         valid_index = index_path_current
     else:
@@ -130,6 +167,27 @@ def refresh_all(model_path: str, index_path_current: str):
         gr.update(choices=models, value=valid_model),
         gr.update(choices=indexes, value=valid_index),
         gr.update(choices=speakers, value=speakers[0] if speakers else 0),
+    )
+
+
+def on_model_change(model_path: str):
+    """
+    Called when the user selects a different model.
+    Returns updates for: index_path, speaker_id, ode_steps, ode_method,
+    guidance_scale, f0_method.
+    """
+    cfg = _load_infer_config(model_path)
+    speakers = get_speakers_id(model_path)
+    auto_index = match_index(model_path)
+
+    return (
+        gr.update(value=auto_index),                                  # index_path
+        gr.update(choices=speakers,
+                  value=speakers[0] if speakers else 0),              # speaker_id
+        gr.update(value=cfg["ode_steps"]),                            # ode_steps
+        gr.update(value=cfg["ode_method"]),                           # ode_method
+        gr.update(value=cfg["guidance_scale"]),                       # guidance_scale
+        gr.update(value=cfg["f0_method"]),                            # f0_method
     )
 
 
@@ -147,7 +205,7 @@ def run_inference(
     f0_method: str,
     index_path: str,
     index_rate: float,
-    guidance_scale: float = 1.0,
+    guidance_scale: float = 1.5,
 ):
     """Run voice conversion inference."""
     global _pipeline
@@ -160,11 +218,9 @@ def run_inference(
     try:
         from kazeflow.infer.pipeline import KazeFlowPipeline
 
-        # Resolve index path
         idx_path = index_path.strip() if index_path and index_path.strip() else None
         cache_key = (model_path, idx_path)
 
-        # Load pipeline (cache if same model + index)
         if _pipeline is None or getattr(_pipeline, "_cache_key", None) != cache_key:
             _pipeline = KazeFlowPipeline(
                 checkpoint_path=model_path,
@@ -184,7 +240,6 @@ def run_inference(
             guidance_scale=guidance_scale,
         )
 
-        # Save output
         output_path = "output_kazeflow.wav"
         _pipeline.save_audio(waveform, output_path)
 
@@ -240,29 +295,34 @@ def create_inference_tab():
 
             # ── Right: Settings & Run ────────────────────────────────
             with gr.Column(scale=1):
-                gr.Markdown("### Settings")
+                gr.Markdown(
+                    "### Settings\n"
+                    "_Defaults are loaded from the model's `config.json` automatically._"
+                )
                 ode_steps = gr.Slider(
                     label="ODE Steps",
-                    minimum=2, maximum=64, step=1, value=16,
-                    info="More steps = higher quality, slower. Ignored for Direct Mel models.",
+                    minimum=1, maximum=64, step=1,
+                    value=_INFER_DEFAULTS["ode_steps"],
+                    info="Steps for the RFM ODE solver. 4 is the default (fast & high-quality).",
                 )
 
                 with gr.Row():
                     ode_method = gr.Radio(
                         label="ODE Method",
                         choices=["euler", "midpoint", "rk4"],
-                        value="midpoint",
+                        value=_INFER_DEFAULTS["ode_method"],
                     )
                     f0_method = gr.Radio(
                         label="F0 Method",
                         choices=["rmvpe"],
-                        value="rmvpe",
+                        value=_INFER_DEFAULTS["f0_method"],
                     )
 
                 guidance_scale = gr.Slider(
                     label="Guidance Scale (CFG)",
-                    minimum=1.0, maximum=5.0, step=0.1, value=1.0,
-                    info="1.0 = off. Higher = stronger speaker conditioning. Ignored for Direct Mel models.",
+                    minimum=1.0, maximum=5.0, step=0.1,
+                    value=_INFER_DEFAULTS["guidance_scale"],
+                    info="1.0 = off. Higher = stronger speaker conditioning (1.5 is the default).",
                 )
 
                 with gr.Accordion("FAISS Index", open=False):
@@ -287,13 +347,10 @@ def create_inference_tab():
 
         # --- Events ---
         model_selector.change(
-            fn=lambda m: (
-                gr.update(value=match_index(m)),
-                gr.update(choices=get_speakers_id(m),
-                          value=get_speakers_id(m)[0] if get_speakers_id(m) else 0),
-            ),
+            fn=on_model_change,
             inputs=[model_selector],
-            outputs=[index_path, speaker_id],
+            outputs=[index_path, speaker_id, ode_steps, ode_method,
+                     guidance_scale, f0_method],
         )
         refresh_btn.click(
             fn=refresh_all,

@@ -446,10 +446,6 @@ class KazeFlowPipeline:
         logger.info("Energy-gated SPIN: %.1f%% frames silenced (gate<0.1)",
                      100 * (gate < 0.1).float().mean().item())
 
-        # Keep source energy for DirectMelPredictor conditioning.
-        # mel_for_gate is (1, n_mels, T_mel); mean across freq → (1, 1, T_mel).
-        _source_energy = mel_for_gate.mean(dim=1, keepdim=True)
-
         del mel_for_gate, mel_energy, gate
 
         # Free feature extraction models from GPU
@@ -492,35 +488,18 @@ class KazeFlowPipeline:
         # Mask
         x_mask = torch.ones(1, 1, min_len, device=self.device)
 
-        # Generate mel from conditioning
-        if self.architecture == "direct_mel":
-            # Interpolate source energy to match aligned frame count
-            if _source_energy.shape[2] != min_len:
-                _source_energy = F.interpolate(
-                    _source_energy, size=min_len,
-                    mode="linear", align_corners=False,
-                )
-            # Direct mel regression: single deterministic forward pass
-            mel_hat = self.flow.sample(
-                content=spin_features,
-                f0=f0,
-                x_mask=x_mask,
-                g=g,
-                energy=_source_energy,
-            )
-        else:
-            # Flow matching: ODE solver
-            # NOTE: ODE solver MUST run in float32 — float16 accumulates
-            # catastrophic error over multiple integration steps.
-            mel_hat = self.flow.sample(
-                content=spin_features,
-                f0=f0,
-                x_mask=x_mask,
-                g=g,
-                n_steps=ode_steps,
-                method=ode_method,
-                guidance_scale=guidance_scale,
-            )
+        # Generate mel from conditioning via Flow matching (RFM) ODE solver
+        # NOTE: ODE solver MUST run in float32 — float16 accumulates
+        # catastrophic error over multiple integration steps.
+        mel_hat = self.flow.sample(
+            content=spin_features,
+            f0=f0,
+            x_mask=x_mask,
+            g=g,
+            n_steps=ode_steps,
+            method=ode_method,
+            guidance_scale=guidance_scale,
+        )
 
         # Free flow intermediates before vocoder
         del spin_features, x_mask
@@ -539,95 +518,50 @@ class KazeFlowPipeline:
 
         T_mel = mel_hat.shape[2]
 
-        if self.architecture == "direct_mel":
-            # Direct mel: chunk long audio to avoid VRAM OOM on modest GPUs.
-            _chunk_frames = 600   # ~6s at 100Hz frame rate
-            _overlap_frames = 16  # overlap for smooth crossfade
+        # Chunked vocoder for long audio to manage VRAM after
+        # the ODE solver has already consumed a significant amount.
+        _chunk_frames = 400   # ~4s at 100Hz frame rate
+        _overlap_frames = 16  # overlap for smooth crossfade
 
-            if T_mel <= _chunk_frames:
-                waveform = self.vocoder(mel_hat, f0_squeezed, g=g)
-            else:
-                _stride = _chunk_frames - _overlap_frames
-                _hop = self.hop_length
-                _xfade_samples = _overlap_frames * _hop
-                wav_chunks = []
-                prev_overlap = None
-
-                pos = 0
-                while pos < T_mel:
-                    end = min(pos + _chunk_frames, T_mel)
-                    mel_chunk = mel_hat[:, :, pos:end]
-                    f0_chunk = f0_squeezed[:, pos:end]
-
-                    wav_chunk = self.vocoder(mel_chunk, f0_chunk, g=g)
-                    wav_chunk = wav_chunk.float().squeeze(0).squeeze(0)
-
-                    if prev_overlap is not None:
-                        cur_head = wav_chunk[:_xfade_samples]
-                        fade_in = torch.linspace(0, 1, _xfade_samples, device=wav_chunk.device)
-                        blended = prev_overlap * (1 - fade_in) + cur_head * fade_in
-                        wav_chunks.append(blended)
-                        body_start = _xfade_samples
-                    else:
-                        body_start = 0
-
-                    if end < T_mel:
-                        prev_overlap = wav_chunk[-_xfade_samples:].clone()
-                        wav_chunks.append(wav_chunk[body_start:-_xfade_samples])
-                    else:
-                        wav_chunks.append(wav_chunk[body_start:])
-                        prev_overlap = None
-
-                    pos += _stride
-                    del mel_chunk, f0_chunk, wav_chunk
-                    torch.cuda.empty_cache()
-
-                waveform = torch.cat(wav_chunks, dim=0).unsqueeze(0)
+        if T_mel <= _chunk_frames:
+            waveform = self.vocoder(mel_hat, f0_squeezed, g=g)
         else:
-            # CFM: chunked vocoder for long audio to manage VRAM after
-            # the ODE solver has already consumed a significant amount.
-            _chunk_frames = 400   # ~4s at 100Hz frame rate
-            _overlap_frames = 16  # overlap for smooth crossfade
+            _stride = _chunk_frames - _overlap_frames
+            _hop = self.hop_length
+            _xfade_samples = _overlap_frames * _hop
+            wav_chunks = []
+            prev_overlap = None  # saved tail from previous chunk
 
-            if T_mel <= _chunk_frames:
-                waveform = self.vocoder(mel_hat, f0_squeezed, g=g)
-            else:
-                _stride = _chunk_frames - _overlap_frames
-                _hop = self.hop_length
-                _xfade_samples = _overlap_frames * _hop
-                wav_chunks = []
-                prev_overlap = None  # saved tail from previous chunk
+            pos = 0
+            while pos < T_mel:
+                end = min(pos + _chunk_frames, T_mel)
+                mel_chunk = mel_hat[:, :, pos:end]
+                f0_chunk = f0_squeezed[:, pos:end]
 
-                pos = 0
-                while pos < T_mel:
-                    end = min(pos + _chunk_frames, T_mel)
-                    mel_chunk = mel_hat[:, :, pos:end]
-                    f0_chunk = f0_squeezed[:, pos:end]
+                wav_chunk = self.vocoder(mel_chunk, f0_chunk, g=g)
+                wav_chunk = wav_chunk.float().squeeze(0).squeeze(0)
 
-                    wav_chunk = self.vocoder(mel_chunk, f0_chunk, g=g)
-                    wav_chunk = wav_chunk.float().squeeze(0).squeeze(0)
+                if prev_overlap is not None:
+                    cur_head = wav_chunk[:_xfade_samples]
+                    fade_in = torch.linspace(0, 1, _xfade_samples, device=wav_chunk.device)
+                    blended = prev_overlap * (1 - fade_in) + cur_head * fade_in
+                    wav_chunks.append(blended)
+                    body_start = _xfade_samples
+                else:
+                    body_start = 0
 
-                    if prev_overlap is not None:
-                        cur_head = wav_chunk[:_xfade_samples]
-                        fade_in = torch.linspace(0, 1, _xfade_samples, device=wav_chunk.device)
-                        blended = prev_overlap * (1 - fade_in) + cur_head * fade_in
-                        wav_chunks.append(blended)
-                        body_start = _xfade_samples
-                    else:
-                        body_start = 0
+                if end < T_mel:
+                    prev_overlap = wav_chunk[-_xfade_samples:].clone()
+                    wav_chunks.append(wav_chunk[body_start:-_xfade_samples])
+                else:
+                    wav_chunks.append(wav_chunk[body_start:])
+                    prev_overlap = None
 
-                    if end < T_mel:
-                        prev_overlap = wav_chunk[-_xfade_samples:].clone()
-                        wav_chunks.append(wav_chunk[body_start:-_xfade_samples])
-                    else:
-                        wav_chunks.append(wav_chunk[body_start:])
-                        prev_overlap = None
+                pos += _stride
+                del mel_chunk, f0_chunk, wav_chunk
+                torch.cuda.empty_cache()
 
-                    pos += _stride
-                    del mel_chunk, f0_chunk, wav_chunk
-                    torch.cuda.empty_cache()
-
-                waveform = torch.cat(wav_chunks, dim=0).unsqueeze(0)
+            waveform = torch.cat(wav_chunks, dim=0).unsqueeze(0)
 
         wav_out = waveform.float().squeeze()  # (T_audio,)
         logger.info(

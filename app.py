@@ -1,8 +1,13 @@
 """
-KazeFlow — Flow Matching + ChouwaGAN Voice Conversion
+KazeFlow — Rectified Flow Matching + ChouwaGAN Voice Conversion
 
-A high-quality voice conversion system using Conditional Flow Matching
+A high-quality voice conversion system using Rectified Flow Matching (RFM)
 for content-to-mel generation and ChouwaGAN for mel-to-waveform synthesis.
+
+Three-stage training pipeline:
+  Stage 1: Pretrain RFM on multi-speaker data (Pretrain tab)
+  Stage 2: Train ChouwaGAN vocoder on frozen RFM (Vocoder tab)
+  Stage 3: Joint fine-tune on target speaker (Train tab)
 """
 
 import os
@@ -24,6 +29,7 @@ os.environ.setdefault("AUTOTUNE_VERBOSE", "0")
 from tabs.inference import create_inference_tab
 from tabs.train import create_training_tab
 from tabs.pretrain import create_pretrain_tab
+from tabs.vocoder import create_vocoder_tab
 from kazeflow.tools.prerequisites_download import check_and_download_prerequisites
 from kazeflow.tools.generate_mutes import generate_mutes
 
@@ -215,12 +221,14 @@ def create_app():
     with gr.Blocks(title="KazeFlow", theme=_build_theme(), css=_HIDE_FOOTER_CSS) as app:
         gr.Markdown(
             "# KazeFlow\n"
-            "High-quality voice conversion using Conditional Flow Matching"
+            "High-quality voice conversion · RFM + ChouwaGAN · "
+            "3-stage pipeline: Pretrain → Vocoder → Fine-tune"
         )
 
         create_inference_tab()
         create_training_tab()
         create_pretrain_tab()
+        create_vocoder_tab()
 
     return app
 

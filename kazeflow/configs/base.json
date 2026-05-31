@@ -1,6 +1,6 @@
 {
   "model": {
-    "architecture": "cfm",
+    "architecture": "rfm",
     "sample_rate": 48000,
     "hop_length": 480,
     "n_fft": 2048,
@@ -17,7 +17,7 @@
       "kernel_size": 7,
       "dilation_rate": 2,
       "dropout": 0.1,
-      "sigma_min": 0.0001,
+      "velocity_weighting": true,
       "t_sampling": "logit_normal",
       "t_logit_mean": 0.0,
       "t_logit_std": 1.0,
@@ -100,13 +100,7 @@
       "use_san": true
     },
     "speaker_embed_dim": 256,
-    "n_speakers": 1,
-    "mel_discriminator": {
-      "n_scales": 5,
-      "channels": 64,
-      "max_channels": 256,
-      "n_layers": 4
-    }
+    "n_speakers": 1
   },
   "train": {
     "batch_size": 8,
@@ -167,15 +161,9 @@
     "torch_compile": false,
     "compile_mode": "default",
     "ode_steps_train_min": 2,
-    "ode_steps_train_max": 16,
+    "ode_steps_train_max": 4,
     "gt_mel_ratio": 0.3,
-    "n_disc_steps": 1,
-    "e2e_epochs": 20,
-    "e2e_lr_scale": 0.1,
-    "c_e2e_wav": 0.1,
-    "e2e_grad_clip_flow": 1.0,
-    "e2e_grad_checkpoint": true,
-    "e2e_segment_frames": 0
+    "n_disc_steps": 1
   },
   "inference": {
     "ode_steps": 4,
